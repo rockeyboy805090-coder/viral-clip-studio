@@ -14,3 +14,10 @@ google-generativeai>=0.8,<1.0
 # yt-dlp (pip package ships the `yt-dlp` binary; youtube_job.py falls
 # back to `python -m yt_dlp` if the binary is not on PATH). Free, no key.
 yt-dlp>=2024.8,<2027
+# V2 fix round 2 (15 Nov 2026) — browser impersonation for yt-dlp:
+# curl-cffi lets yt-dlp --impersonate chrome/firefox, which makes its
+# TLS fingerprint look like a real browser (the standard current
+# bypass for YouTube 403s from datacenter IPs). Required by
+# youtube_job.py — without it impersonation silently falls back to
+# plain yt-dlp. Free, no key. Wheels ship prebuilt libcurl.
+curl-cffi>=0.10,<1.0

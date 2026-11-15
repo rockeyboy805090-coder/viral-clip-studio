@@ -26,16 +26,38 @@ the real work):
   `python -m yt_dlp`.
 - YouTube can block downloads from datacenter IPs (Render) with a
   bot-check ("Sign in to confirm you're not a bot"). The download
-  first probes with player clients in order android -> ios -> web
-  (each 120s) and downloads with the first client that works —
-  YouTube often still serves the mobile clients when it 403s the
-  web client. If every client is blocked, the job fails with a plain
-  Hinglish message (try later, or upload the file and use V1).
-  yt-dlp also needs a JS runtime (`node`) or it warns that
-  extraction without one is deprecated: Render's build downloads an
-  official Node 20 tarball into .node/ (render.yaml) and this module
-  puts .node/bin on the subprocess PATH; locally the system node is
-  used. Locally (this VM) downloads work.
+  first probes with player clients in order android -> ios ->
+  tv_embedded -> mediaconnect -> web_safari -> web (each 120s) and
+  downloads with the first client that works — YouTube often still
+  serves the mobile/TV clients when it 403s the web client. The
+  probe/download also impersonate a real Chrome browser
+  (`--impersonate chrome` via curl-cffi, Firefox fallback) so the
+  TLS fingerprint looks like a browser, not a script. If every
+  client is blocked, the job fails with a plain Hinglish message
+  (try later, or upload the file and use V1).
+- yt-dlp also needs a JS runtime (`node`) or it warns that
+  extraction without one is deprecated. LESSON (round 2, 15 Nov
+  2026): recent yt-dlp enables ONLY `deno` by default — node on
+  PATH is NOT enough, and `--js-runtimes node` alone still leaves
+  the EJS challenge-solver warning on yt-dlp >= 2026.10. So this
+  module passes the node binary by EXPLICIT absolute path
+  (`--js-runtimes node:<path>`, found via shutil.which plus
+  ROOT/.node/bin and /opt/render/project/src/.node/bin) AND
+  `--remote-components ejs:github` (downloads the EJS challenge
+  solver, cached). Render's build downloads an official Node 20
+  tarball into .node/ (render.yaml) — the build ALSO verifies
+  `.node/bin/node --version` actually runs, and the startCommand
+  logs whether the bundled node is present. Every job records
+  diagnostics (node path found or null, yt-dlp version,
+  impersonation target, clients tried) in its result so a failed
+  job is diagnosable, and /health exposes the same diagnostics.
+- The yt-dlp command prefers `python -m yt_dlp` from the venv when
+  curl_cffi is importable there (that is the ONLY way
+  --impersonate works — the standalone PyInstaller binary cannot
+  impersonate: "Impersonate target chrome is not available").
+  Otherwise the standalone binary is used, else plain module.
+  Locally (this VM) the venv module + impersonation also fixes
+  the MITM-proxy SSL failure (libcurl honours SSL_CERT_FILE).
 """
 from __future__ import annotations
 
@@ -48,6 +70,7 @@ import sys
 import uuid
 from contextlib import closing
 from datetime import datetime, timezone
+from functools import lru_cache
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
@@ -181,20 +204,37 @@ def _update_job(job_id: str, status: str | None = None,
         conn.commit()
 
 
-def _yt_dlp_cmd() -> list[str]:
-    """yt-dlp as a standalone binary, else `python -m yt_dlp`.
+@lru_cache(maxsize=1)
+def _curl_cffi_available() -> bool:
+    """True when `import curl_cffi` works in this interpreter.
 
-    Preference order matters on this VM: the standalone binary
-    (~/.local/bin/yt-dlp, 2026.08.19) works through the egress
-    proxy's MITM CA (it honours SSL_CERT_FILE), while the venv's
-    newer `python -m yt_dlp` (2026.10.26) fails SSL verification
-    here (self-signed cert in chain — it verifies against its own
-    CA bundle, not SSL_CERT_FILE). The server process PATH does not
-    include ~/.local/bin, so that path is checked explicitly.
-    On Render there is no ~/.local/bin binary, so the pip-installed
-    module is used — and Render has no MITM proxy, so it verifies
-    fine there.
+    curl-cffi is what makes yt-dlp --impersonate work. The venv
+    module (sys.executable -m yt_dlp) can use it; the standalone
+    PyInstaller binary can NOT (it bundles its own interpreter
+    without curl_cffi) — verified 15 Nov 2026: the binary fails
+    with 'Impersonate target "chrome" is not available'.
     """
+    try:
+        __import__("curl_cffi")
+        return True
+    except Exception:
+        return False
+
+
+def _yt_dlp_cmd() -> list[str]:
+    """yt-dlp command, chosen so --impersonate works when possible.
+
+    Order: (1) venv `python -m yt_dlp` when curl_cffi is
+    importable — the ONLY impersonation-capable path (and on this
+    VM it also fixes the MITM-proxy SSL failure, because curl_cffi
+    via libcurl honours SSL_CERT_FILE); (2) standalone `yt-dlp`
+    binary (~/.local/bin or PATH); (3) plain `python -m yt_dlp`.
+    On Render the pip-installed console script runs under the venv
+    Python, so (1) applies there once curl-cffi is in
+    requirements.txt.
+    """
+    if _curl_cffi_available():
+        return [sys.executable, "-m", "yt_dlp"]
     for cand in (shutil.which("yt-dlp"),
                  str(Path.home() / ".local/bin/yt-dlp")):
         if cand and Path(cand).is_file() and os.access(cand, os.X_OK):
@@ -202,13 +242,128 @@ def _yt_dlp_cmd() -> list[str]:
     return [sys.executable, "-m", "yt_dlp"]
 
 
-# --- Player-client fallback + JS runtime (fix 15 Nov 2026) -----------
-# Live failure on Render: default web client got HTTP 403
-# ("Unable to download API page ... Failed to extract any player
-# response"). YouTube blocks the web client from datacenter IPs but
-# often still serves the mobile clients, so we probe in order
-# android -> ios -> web (120s each) and download with the first
-# client that works. The winning client is recorded in the job
+@lru_cache(maxsize=1)
+def _yt_dlp_version() -> str:
+    """yt-dlp version string ('' when it cannot run). Cached."""
+    try:
+        r = subprocess.run(_yt_dlp_cmd() + ["--version"],
+                           capture_output=True, text=True, timeout=60,
+                           env=_yt_dlp_env())
+        return (r.stdout or "").strip().splitlines()[0] if r.returncode == 0 else ""
+    except Exception:
+        return ""
+
+
+def _find_node() -> str | None:
+    """Absolute path of a usable `node` binary, or None.
+
+    Checks, in order: PATH, ROOT/.node/bin/node (Render build),
+    $PWD/.node/bin/node, /opt/render/project/src/.node/bin/node
+    (Render's default project dir — covers a startCommand whose
+    CWD differs from the code dir). A path is only returned when
+    the file exists AND is executable.
+    """
+    cands: list[str] = []
+    w = shutil.which("node")
+    if w:
+        cands.append(w)
+    for base in (ROOT, Path.cwd(), Path("/opt/render/project/src")):
+        p = base / ".node" / "bin" / "node"
+        if p.is_file() and os.access(p, os.X_OK):
+            cands.append(str(p))
+    env_node = os.environ.get("NODE_PATH", "").strip()
+    if env_node and Path(env_node).is_file() and os.access(env_node, os.X_OK):
+        cands.append(env_node)
+    for c in cands:
+        try:
+            r = subprocess.run([c, "--version"], capture_output=True,
+                               text=True, timeout=15)
+            if r.returncode == 0 and (r.stdout or "").strip().startswith("v"):
+                return c
+        except Exception:
+            continue
+    return None
+
+
+@lru_cache(maxsize=1)
+def _impersonation_target() -> str | None:
+    """'chrome' / 'firefox' when yt-dlp can impersonate it, else None.
+
+    Detected from `yt-dlp --list-impersonate-targets` (no network
+    call): a target counts only when its line does NOT say
+    "(unavailable)". Chrome first, Firefox fallback — the standard
+    bypass for YouTube 403s (real-browser TLS fingerprint).
+    """
+    try:
+        r = subprocess.run(_yt_dlp_cmd() + ["--list-impersonate-targets"],
+                           capture_output=True, text=True, timeout=60,
+                           env=_yt_dlp_env())
+    except Exception:
+        return None
+    out = (r.stdout or "") + (r.stderr or "")
+    for target in ("Chrome", "Firefox"):
+        for line in out.splitlines():
+            if line.strip().startswith(target) and "(unavailable)" not in line:
+                return target.lower()
+    return None
+
+
+def _impersonation_args() -> list[str]:
+    target = _impersonation_target()
+    return ["--impersonate", target] if target else []
+
+
+def _js_runtime_args() -> list[str]:
+    """Explicit `--js-runtimes node:<absolute path>` when node exists.
+
+    MUST be the explicit path: recent yt-dlp enables only `deno`
+    by default, so node on PATH alone is ignored (verified 15 Nov
+    2026 — warning persisted with node on PATH, vanished with the
+    explicit path). Returns [] when no node binary is found, so a
+    missing node degrades to a warning instead of a hard failure.
+    """
+    node = _find_node()
+    return ["--js-runtimes", f"node:{node}"] if node else []
+
+
+def _base_yt_dlp_args() -> list[str]:
+    """Args on EVERY yt-dlp call: JS runtime + EJS + impersonation.
+
+    `--remote-components ejs:github` fetches yt-dlp's JS challenge
+    solver (cached in ~/.cache/yt-dlp; warns and continues if
+    GitHub is unreachable). Without it yt-dlp >= 2026.10 warns
+    'n challenge solving failed: Some formats may be missing'.
+    """
+    return (_js_runtime_args()
+            + ["--remote-components", "ejs:github"]
+            + _impersonation_args())
+
+
+def youtube_runtime_diagnostics() -> dict:
+    """Cheap cached diagnostics for /health and job records."""
+    node = _find_node()
+    return {"node_found": node,
+            "yt_dlp_version": _yt_dlp_version(),
+            "curl_cffi": _curl_cffi_available(),
+            "impersonation": _impersonation_target(),
+            "yt_dlp_cmd": " ".join(_yt_dlp_cmd())}
+
+
+# --- Player-client fallback + JS runtime + impersonation (round 2) --
+# Live failure on Render (15 Nov 2026, job 857552aa618a): default web
+# client got HTTP 403 ("Unable to download API page ... Failed to
+# extract any player response") and android/ios did NOT help — the
+# Render datacenter IP itself is blocked, not just the web client.
+# Round 2 widens the probe order AND impersonates a real browser:
+# android -> ios -> tv_embedded -> mediaconnect -> web_safari -> web
+# (120s each). Client names verified against live YouTube with the
+# installed yt-dlp (15 Nov 2026): tv_embedded + mediaconnect
+# returned full JSON; web_safari is a valid client but got a
+# bot-check on this VM (kept — it may work from Render);
+# android_music / ios_music are NOT valid clients ("Skipping
+# unsupported client") and are NOT in this list. tv_embedded and
+# mediaconnect need no custom user-agent — yt-dlp sets the correct
+# per-client UA itself. The winning client is recorded in the job
 # result (result["player_client"]) and in the status message.
 _PLAYER_CLIENTS: tuple[tuple[str, list[str]], ...] = (
     ("android", ["--extractor-args", "youtube:player_client=android",
@@ -219,38 +374,73 @@ _PLAYER_CLIENTS: tuple[tuple[str, list[str]], ...] = (
              "--user-agent",
              "com.google.ios.youtube/19.09.3 "
              "(iPhone14,3; U; CPU iOS 15_6 like Mac OS X)"]),
+    ("tv_embedded", ["--extractor-args",
+                     "youtube:player_client=tv_embedded"]),
+    ("mediaconnect", ["--extractor-args",
+                      "youtube:player_client=mediaconnect"]),
+    ("web_safari", ["--extractor-args",
+                    "youtube:player_client=web_safari"]),
     ("web", []),
 )
 _PROBE_TIMEOUT = 120  # seconds per player-client probe attempt
 
 
 def _yt_dlp_env() -> dict:
-    """Subprocess env for yt-dlp: .node/bin first on PATH if present.
+    """Subprocess env for yt-dlp: found node bin dir first on PATH.
 
     Render's build extracts the official Node 20 tarball into
     <project>/.node (render.yaml); locally the system node is used.
-    yt-dlp picks `node` up from PATH as its JS runtime, which
-    silences the "extraction without a JS runtime is deprecated"
-    warning.
+    The explicit `--js-runtimes node:<path>` flag is the real fix
+    (see _js_runtime_args); PATH is still prepended as a belt-and-
+    braces measure for any other tool yt-dlp spawns.
     """
     env = dict(os.environ)
+    node = _find_node()
+    dirs: list[str] = []
+    if node:
+        dirs.append(str(Path(node).parent))
     node_dir = ROOT / ".node" / "bin"
-    if node_dir.is_dir() and str(node_dir) not in env.get("PATH", ""):
-        env["PATH"] = f"{node_dir}:{env.get('PATH', '')}"
+    if node_dir.is_dir():
+        dirs.append(str(node_dir))
+    path = env.get("PATH", "")
+    for d in dirs:
+        if d not in path:
+            path = f"{d}:{path}"
+    env["PATH"] = path
     return env
 
 
-def _js_runtime_args() -> list[str]:
-    """Explicit `--js-runtimes node` when a node binary is findable."""
-    env = _yt_dlp_env()
-    if shutil.which("node", path=env.get("PATH", "")):
-        return ["--js-runtimes", "node"]
-    return []
+def _strip_impersonate(args: list[str]) -> list[str]:
+    """Remove a `--impersonate <target>` pair from an arg list."""
+    out: list[str] = []
+    skip_next = False
+    for a in args:
+        if skip_next:
+            skip_next = False
+            continue
+        if a == "--impersonate":
+            skip_next = True
+            continue
+        out.append(a)
+    return out
 
 
 def _run_yt_dlp(args: list[str], timeout: int) -> subprocess.CompletedProcess:
-    return subprocess.run(_yt_dlp_cmd() + args, capture_output=True,
+    """Run yt-dlp; if impersonation itself is the failure, retry
+    once without it (a broken impersonation flag must never kill a
+    job that plain yt-dlp could have done)."""
+    proc = subprocess.run(_yt_dlp_cmd() + args, capture_output=True,
                           text=True, timeout=timeout, env=_yt_dlp_env())
+    if proc.returncode != 0 and "--impersonate" in args:
+        text = ((proc.stderr or "") + (proc.stdout or "")).lower()
+        if "impersonate" in text and ("not available" in text
+                                      or "curl-cffi" in text
+                                      or "curl_cffi" in text):
+            proc = subprocess.run(
+                _yt_dlp_cmd() + _strip_impersonate(args),
+                capture_output=True, text=True, timeout=timeout,
+                env=_yt_dlp_env())
+    return proc
 
 
 def _check_yt_dlp_installed() -> None:
@@ -306,7 +496,7 @@ def _probe_video(url: str) -> tuple[dict, str, list[str]]:
         tried.append(client)
         try:
             probe = _run_yt_dlp(
-                _js_runtime_args() + extra +
+                _base_yt_dlp_args() + extra +
                 ["--dump-json", "--no-download", "--no-playlist", url],
                 timeout=_PROBE_TIMEOUT)
         except subprocess.TimeoutExpired:
@@ -321,19 +511,19 @@ def _probe_video(url: str) -> tuple[dict, str, list[str]]:
     raise RuntimeError(_download_failed_message(last_tail))
 
 
-def _download_video(url: str, job_dir: Path) -> tuple[Path, dict, str]:
+def _download_video(url: str, job_dir: Path) -> tuple[Path, dict, str, list[str]]:
     """Download a YouTube video to <job_dir>/video.mp4 (best <=720p).
 
     Probes with the player-client fallback first, then downloads
     with the winning client. If that download itself hits a 403,
     the remaining clients are retried (900s each); a non-403
     download error is not retried — another client won't fix it.
-    Returns (video_path, info_dict, winning_client).
+    Returns (video_path, info_dict, winning_client, clients_tried).
     Raises RuntimeError with a plain Hinglish message on failure.
     """
     job_dir.mkdir(parents=True, exist_ok=True)
     _check_yt_dlp_installed()
-    info, client, _tried = _probe_video(url)
+    info, client, tried = _probe_video(url)
     out_tmpl = str(job_dir / "video.%(ext)s")
     fmt = ("bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/"
            "best[height<=720][ext=mp4]/best")
@@ -345,7 +535,7 @@ def _download_video(url: str, job_dir: Path) -> tuple[Path, dict, str]:
         timeout = 1800 if attempt_no == 0 else 900
         try:
             dl = _run_yt_dlp(
-                _js_runtime_args() + extra +
+                _base_yt_dlp_args() + extra +
                 ["-f", fmt, "--merge-output-format", "mp4",
                  "-o", out_tmpl, "--no-playlist", url], timeout=timeout)
         except subprocess.TimeoutExpired:
@@ -369,7 +559,7 @@ def _download_video(url: str, job_dir: Path) -> tuple[Path, dict, str]:
             raise RuntimeError(
                 "yt-dlp chala par video file nahi mili — download adhura raha.")
         video_path = cands[0]
-    return video_path, info, client
+    return video_path, info, client, tried
 
 
 def _register_download(video_path: Path, title: str) -> dict:
@@ -428,16 +618,23 @@ def run_youtube_job(job_id: str) -> None:
                     "rendered": []}
     try:
         # --- download ---
+        # Diagnostics FIRST, so even a failed job says exactly what
+        # the downloader had to work with (node path or null,
+        # yt-dlp version, impersonation target).
+        result["diagnostics"] = youtube_runtime_diagnostics()
         _update_job(job_id, status="downloading",
-                    message="YouTube se video download ho raha hai…")
+                    message="YouTube se video download ho raha hai…",
+                    result=result)
         job_dir = YT_DIR / job_id
-        video_path, info, client = _download_video(job["url"], job_dir)
+        video_path, info, client, tried = _download_video(job["url"], job_dir)
         title = str(info.get("title") or "youtube video")
         duration = info.get("duration")
         if duration:
             result["video_duration_sec"] = round(float(duration), 1)
         result["video_title"] = title
         result["player_client"] = client
+        result["clients_tried"] = tried
+        result["impersonation"] = result["diagnostics"].get("impersonation")
 
         # --- register as a normal upload/project ---
         upload = _register_download(video_path, title)

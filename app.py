@@ -50,7 +50,7 @@ from workflow import (create_batch, delete_project, get_batch,
                       set_clip_approval)
 from youtube_job import (create_youtube_job, get_youtube_job,
                          init_youtube_jobs_table, run_youtube_job,
-                         validate_youtube_url)
+                         validate_youtube_url, youtube_runtime_diagnostics)
 
 try:
     from dotenv import load_dotenv  # type: ignore
@@ -113,7 +113,13 @@ def index() -> HTMLResponse:
 
 @app.get("/health")
 def health() -> JSONResponse:
-    return JSONResponse({"status": "ok", "phase": 5, "ffmpeg": ffmpeg_status()})
+    # youtube diagnostics are cached in youtube_job (one yt-dlp
+    # --version + one --list-impersonate-targets at first call) —
+    # cheap, and they prove on the LIVE instance whether node and
+    # browser impersonation are actually available there.
+    return JSONResponse({"status": "ok", "phase": 5,
+                         "ffmpeg": ffmpeg_status(),
+                         "youtube": youtube_runtime_diagnostics()})
 
 
 def _get_upload_row(upload_id: str) -> dict | None:
