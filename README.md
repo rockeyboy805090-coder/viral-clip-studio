@@ -2,7 +2,9 @@
 
 Local-first video clipping app, built in phases. **Current status: Phase 6 COMPLETE — live on Render Free since 15 Nov 2026 (https://viral-clip-studio-iy6g.onrender.com, `/health` = `{"status":"ok","phase":5}`). GitHub: https://github.com/rockeyboy805090-coder/viral-clip-studio (public).**
 
-## Language rule — DEFAULT: ENGLISH (user correction, Phase 4)
+## Phase 6 fix (15 Nov 2026) — faster-whisper replaces openai-whisper
+
+Live `/transcribe` CRASHED the Render Free instance twice (openai-whisper + torch need ~2 GB RAM; Render Free has 512 MB). The service restarted and the uploaded project was lost (ephemeral storage). Fix: `transcriber.py` now uses **faster-whisper** (CTranslate2, CPU int8, no torch) — same Whisper model names (`tiny`/`base`/`small`), same word timestamps, same transcript JSON/TXT format, same `WHISPER_LANGUAGE`/`WHISPER_MODEL` env vars. `requirements.txt` no longer lists openai-whisper (torch is gone — do NOT re-add it). First transcribe downloads the base model (~150 MB) from HuggingFace, then it is cached. Local + live re-test numbers are in the Phase 6 fix section at the end of this README.
 
 **Default language: English. Captions in English words.**
 - Transcription default is Whisper `language="en"` (env `WHISPER_LANGUAGE=en`). UI has a Language selector: English (default), Hinglish (Roman), Hindi.
@@ -149,7 +151,7 @@ Caveats: render is synchronous (blocks the server 1-3 min per ~47s clip on CPU).
   - Whisper model `tiny` by default (fast, low RAM); `WHISPER_MODEL=base` env override for real use
   - Word-level timestamps, detected language, full text + segments
   - Saved per upload: `outputs/transcripts/<upload_id>.json` + `.txt`
-  - If Whisper is not installed, `POST /transcribe` returns a clear 503 `Whisper install karo: pip install openai-whisper` — never a fake transcript
+  - If faster-whisper is not installed, `POST /transcribe` returns a clear 503 `faster-whisper install karo: pip install faster-whisper` — never a fake transcript
   - If the video has no audio, a clear 400 error (no transcript possible)
 - **Real viral clip finding** (`clip_finder.py`):
   - Candidate 30-60s windows (sliding, segment boundaries, min 25s / max 65s)
@@ -184,13 +186,7 @@ curl -F "upload_id=<id>" -F "top_n=5" http://127.0.0.1:8000/find-clips
 curl http://127.0.0.1:8000/clips/<id>
 ```
 
-Install note (important, learned on this VM): `pip install -r requirements.txt` straight from PyPI tries to download torch **with ~2.5 GB of NVIDIA CUDA libraries** (torch 539 MB + cudnn 519 MB + more) at ~1 MB/s — and the first attempt also failed downloading `triton` (285 MB, connection interrupted after 167 MB). **Do this instead — CPU-only torch first:**
-```bash
-python -m venv .venv2
-TMPDIR=$PWD/.pip-tmp .venv2/bin/pip install --resume-retries 10 --index-url https://download.pytorch.org/whl/cpu torch
-TMPDIR=$PWD/.pip-tmp .venv2/bin/pip install --resume-retries 10 -r requirements.txt
-```
-`TMPDIR` must point to a folder on disk (not `/tmp`, which is a 512 MB tmpfs). If Whisper/torch cannot install, the app still runs and `/transcribe` returns the clear 503 above — transcription is honestly unavailable, not faked.
+Install note (updated 15 Nov 2026 — torch is GONE): transcription now uses faster-whisper (CTranslate2, no torch, no CUDA). Just `pip install -r requirements.txt` — no CPU-torch dance needed. (Historical: Phase 2 used openai-whisper, whose PyPI torch pulled ~2.5 GB of NVIDIA CUDA libs and needed a CPU-only torch install first. That path is obsolete — do NOT re-add openai-whisper/torch.) If faster-whisper cannot install, the app still runs and `/transcribe` returns the clear 503 above — transcription is honestly unavailable, not faked.
 
 Gemini note: no key was set during Phase 2 testing, so all test clips used `scoring_method: "rule_based"`. To use Gemini, copy `.env.example` to `.env` and set `GEMINI_API_KEY=<free key>` — never commit a real `.env`.
 
@@ -265,3 +261,17 @@ These runtime files are created when the app starts and are not source files.
 - Phase 6: GitHub + Render free deploy + live link
 
 No paid service or API key is required for Phase 1. Gemini key is Phase 2 only, and optional — rule-based scoring works without it.
+
+## Phase 6 fix re-test — faster-whisper (15 Nov 2026)
+
+Live `/transcribe` crashed Render Free twice (openai-whisper + torch OOM, 512 MB). Fix: faster-whisper (CTranslate2 int8, no torch) + a stdlib-`wave` WAV decode workaround (faster-whisper 1.2.1's PyAV decoder breaks on av>=14: `av.open() got an unexpected keyword argument 'metadata_errors'`).
+
+Local re-test (same 118.9s English test video, upload `cf004e3bd8924162b832b5ca2134e1c6`):
+
+| Check | Result |
+|---|---|
+| `POST /transcribe` (model cached) | ✅ 29.3s, **304 words** — identical count to old openai-whisper base (304), same opening text ("Good morning friends, today I will share the biggest secret about focus…"), 13 segments, real word timestamps, `en` / `latin`, note "Transcript in English words (Roman script) as requested." — **no quality loss** |
+| Peak server RSS during transcribe | ✅ **426.9 MB** — under Render Free's 512 MB (~85 MB headroom). Old torch stack was ~2 GB+ → definite OOM |
+| `POST /find-clips` | ✅ 3 clips (scores 63/49/40, rule-based, `en`) — Phase 5 had 2 clips (61/45); small difference from faster-whisper segment boundaries, not a regression |
+| `POST /render-clip clip_01` | ✅ 2m20s, 49.03s, 1080x1920, h264, yuv420p, 30fps, AAC, 8,660,854 bytes, SRT 0 non-Latin chars, sidecar JSON present |
+| Live re-test | (fill in after Render auto-deploy: upload → transcribe time + words → clips → render → ZIP) |

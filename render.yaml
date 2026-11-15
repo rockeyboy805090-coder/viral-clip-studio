@@ -4,9 +4,10 @@
 # Env vars to set in the Render dashboard (never commit real keys):
 #   GEMINI_API_KEY=<free key, optional>  WHISPER_LANGUAGE=en  WHISPER_MODEL=base
 # NOTE: Render Free = 512 MB RAM, sleeps after 15 min idle, ~1 min cold start.
-# Whisper base + torch need ~2 GB at install; Render free build may be slow
-# or fail on memory — if it does, transcription will return the honest 503
-# and the rest of the app still works. Heavy rendering is for local laptop use.
+# Transcription now uses faster-whisper (CTranslate2, int8, NO torch) —
+# safe on 512 MB. First transcribe downloads the base model (~150 MB)
+# from HuggingFace, then it is cached. Heavy rendering is for local
+# laptop use.
 services:
   - type: web
     name: viral-clip-studio

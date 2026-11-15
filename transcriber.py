@@ -1,20 +1,26 @@
 """Phase 2: local Whisper transcription — real implementation.
 
-Free stack only: FFmpeg + openai-whisper (local, offline). No paid API,
-no network call for transcription itself.
+Free stack only: FFmpeg + faster-whisper (CTranslate2, NO torch).
+No paid API, no network call for transcription itself (except the
+one-time model download from HuggingFace on first use).
+
+WHY faster-whisper (Phase 6 fix, 15 Nov 2026): openai-whisper + torch
+needs ~2 GB RAM and CRASHED the Render Free instance (512 MB) on
+POST /transcribe — the service restarted and the uploaded project was
+lost (ephemeral storage). faster-whisper runs the same Whisper models
+via CTranslate2 in int8 on CPU: ~150 MB model, a few hundred MB RAM,
+no torch, no CUDA. Same model names (tiny/base/small), same word
+timestamps, same output format.
 
 Behaviour:
 - Extract audio from the video with FFmpeg to 16 kHz mono WAV in
-  outputs/audio/<upload_id>.wav (temp file, deleted after transcription).
-- Load Whisper model "base" by default. Measured on this VM (Nov 2026,
-  192s Hindi speech): tiny = 283 words, mostly garbage, 5:01 min;
-  base = 441 words vs 423 in script, 3:27 min — base is BOTH faster
-  and far more accurate, so it is the default. Env override:
+  a temp file (deleted after transcription).
+- Load faster-whisper model "base" by default. Env override:
   WHISPER_MODEL=tiny (fast smoke test) or small/medium (better still).
-  Model cache: ~/.cache/whisper (Whisper default).
-- If whisper/torch is NOT installed, raise RuntimeError with the clear
-  message "Whisper install karo: pip install openai-whisper" — never fake
-  a transcript.
+  Model cache: ~/.cache/huggingface (faster-whisper default).
+- If faster-whisper is NOT installed, raise RuntimeError with the
+  clear message "faster-whisper install karo: pip install
+  faster-whisper" — never fake a transcript.
 - Returns word-level timestamps: words [{word, start, end}], full text,
   segments, detected language. Saves transcript JSON + .txt per upload
   under outputs/transcripts/<upload_id>.json / .txt
@@ -56,6 +62,22 @@ LANGUAGE_PROMPTS = {
 }
 _ARABIC_RE = re.compile(r"[\u0600-\u06FF\u0750-\u077F\uFB50-\uFDFF\uFE70-\uFEFF]")
 _DEVANAGARI_RE = re.compile(r"[\u0900-\u097F]")
+
+# faster-whisper model names match openai-whisper names (tiny/base/
+# small/medium/large-v3, plus .en variants). Anything else is passed
+# through and faster-whisper raises a clear error for unknown names.
+MODEL_ALIASES = {
+    "tiny.en": "tiny.en",
+    "base.en": "base.en",
+    "small.en": "small.en",
+    "medium.en": "medium.en",
+}
+
+
+def normalize_model(model_name: str | None) -> str:
+    """Map WHISPER_MODEL env / argument to a faster-whisper model name."""
+    name = (model_name or os.getenv("WHISPER_MODEL", "base") or "base").strip().lower()
+    return MODEL_ALIASES.get(name, name)
 
 
 def normalize_language(value: str | None) -> str:
@@ -101,24 +123,51 @@ def extract_audio(video_path: Path, wav_path: Path) -> None:
 
 
 def _load_model(model_name: str):
-    """Import whisper lazily and load the model.
+    """Import faster-whisper lazily and load the model (CPU, int8).
 
-    Lazy import so `import transcriber` works even when Whisper is not
-    installed — the error only appears when transcription is attempted.
+    Lazy import so `import transcriber` works even when faster-whisper
+    is not installed — the error only appears when transcription is
+    attempted. int8 keeps RAM low enough for a 512 MB container.
+    First call downloads the model (~150 MB for base) from
+    HuggingFace into ~/.cache/huggingface.
     """
     try:
-        import whisper  # type: ignore
+        from faster_whisper import WhisperModel  # type: ignore
     except ImportError as exc:
         raise RuntimeError(
-            "Whisper install karo: pip install openai-whisper"
+            "faster-whisper install karo: pip install faster-whisper"
         ) from exc
-    return whisper.load_model(model_name)
+    return WhisperModel(model_name, device="cpu", compute_type="int8")
+
+
+def _read_wav_mono16(wav_path: Path):
+    """Read our FFmpeg-extracted 16 kHz mono PCM16 WAV as float32 samples.
+
+    faster-whisper's own audio decoder (PyAV) breaks on newer av
+    releases (`av.open() got an unexpected keyword argument
+    'metadata_errors'` with av>=14) — so we decode the WAV ourselves
+    with stdlib `wave` and hand faster-whisper a numpy array, which
+    skips its av path entirely. The WAV is always 16 kHz mono PCM16
+    because extract_audio() makes it so (asserted here).
+    """
+    import wave
+
+    import numpy as np  # noqa: F401  (present via faster-whisper deps)
+
+    with wave.open(str(wav_path), "rb") as wf:
+        if wf.getnchannels() != 1 or wf.getsampwidth() != 2 or wf.getframerate() != 16000:
+            raise RuntimeError(
+                "Audio WAV format unexpected (16 kHz mono PCM16 chahiye) — "
+                f"channels={wf.getnchannels()}, width={wf.getsampwidth()}, "
+                f"rate={wf.getframerate()}")
+        frames = wf.readframes(wf.getnframes())
+    return np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32768.0
 
 
 def transcribe(video_path, upload_id: str, model_name: str | None = None,
                initial_prompt: str | None = None,
                language: str | None = None) -> dict:
-    """Transcribe a video file with local Whisper.
+    """Transcribe a video file with local faster-whisper.
 
     Args:
         video_path: path to the uploaded MP4/MOV.
@@ -132,10 +181,10 @@ def transcribe(video_path, upload_id: str, model_name: str | None = None,
             become clean English. The mismatch is recorded in
             language_note, never hidden.
 
-    Returns dict with keys: upload_id, model, language (detected),
-    language_requested, language_note, duration_sec, text, word_count,
-    words [{word, start, end}], segments [{start, end, text}],
-    transcript_json, transcript_txt.
+    Returns dict with keys: upload_id, model, engine, language
+    (detected), language_requested, language_note, duration_sec, text,
+    word_count, words [{word, start, end}], segments
+    [{start, end, text}], transcript_json, transcript_txt.
 
     Side effects: writes outputs/transcripts/<upload_id>.json and .txt.
     The temp WAV is deleted after transcription.
@@ -146,7 +195,7 @@ def transcribe(video_path, upload_id: str, model_name: str | None = None,
         raise ValueError(f"Ye valid video file nahi hai: {probe['error']}")
     if not probe["has_audio"]:
         raise ValueError("Is video me audio nahi hai — transcript nahi ban sakta")
-    model_name = model_name or os.getenv("WHISPER_MODEL", "base")
+    model_name = normalize_model(model_name)
     language_requested = normalize_language(
         language or os.getenv("WHISPER_LANGUAGE") or DEFAULT_LANGUAGE)
     if initial_prompt is None:
@@ -162,37 +211,38 @@ def transcribe(video_path, upload_id: str, model_name: str | None = None,
     try:
         extract_audio(video_path, wav_path)
         model = _load_model(model_name)
-        # word_timestamps=True gives word-level timings (needs the model
-        # to support it — tiny/base do).
-        kwargs: dict = {"word_timestamps": True, "verbose": False,
-                        "language": whisper_lang}
-        if initial_prompt:
-            kwargs["initial_prompt"] = initial_prompt
-        result = model.transcribe(str(wav_path), **kwargs)
+        # Decode the WAV ourselves (see _read_wav_mono16) and pass
+        # float32 samples — faster-whisper's PyAV decoder breaks on
+        # newer av releases. word_timestamps=True gives word timings.
+        audio = _read_wav_mono16(wav_path)
+        segments_gen, info = model.transcribe(
+            audio, language=whisper_lang,
+            initial_prompt=initial_prompt, word_timestamps=True)
+        # Consume the generator fully while the WAV still exists.
+        segments: list[dict] = []
+        words: list[dict] = []
+        for seg in segments_gen:
+            segments.append({
+                "start": round(float(seg.start), 2),
+                "end": round(float(seg.end), 2),
+                "text": str(seg.text or "").strip(),
+            })
+            for w in (seg.words or []):
+                word = str(w.word or "").strip()
+                if not word:
+                    continue
+                words.append({
+                    "word": word,
+                    "start": round(float(w.start), 2),
+                    "end": round(float(w.end), 2),
+                })
+        detected_language = str(getattr(info, "language", None) or "unknown")
+        text = " ".join(s["text"] for s in segments).strip()
     finally:
         wav_path.unlink(missing_ok=True)
 
-    language = str(result.get("language") or "unknown")
-    text = str(result.get("text") or "").strip()
-    words: list[dict] = []
-    segments: list[dict] = []
-    for seg in result.get("segments") or []:
-        segments.append({
-            "start": round(float(seg.get("start", 0.0)), 2),
-            "end": round(float(seg.get("end", 0.0)), 2),
-            "text": str(seg.get("text") or "").strip(),
-        })
-        for w in seg.get("words") or []:
-            word = str(w.get("word") or "").strip()
-            if not word:
-                continue
-            words.append({
-                "word": word,
-                "start": round(float(w.get("start", 0.0)), 2),
-                "end": round(float(w.get("end", 0.0)), 2),
-            })
-    # Fallback: if word timestamps came back empty (some builds), rebuild
-    # words from segments by splitting on spaces — timestamps are then
+    # Fallback: if word timestamps came back empty, rebuild words from
+    # segments by splitting on spaces — timestamps are then
     # segment-level, marked honestly in the output.
     word_timestamps_real = len(words) > 0
     if not word_timestamps_real:
@@ -213,7 +263,8 @@ def transcribe(video_path, upload_id: str, model_name: str | None = None,
     out = {
         "upload_id": upload_id,
         "model": model_name,
-        "language": language,
+        "engine": "faster-whisper",
+        "language": detected_language,
         "language_requested": language_requested,
         "whisper_language": whisper_lang,
         "duration_sec": round(probe["duration"], 2),
