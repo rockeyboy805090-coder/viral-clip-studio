@@ -425,10 +425,17 @@ def render_clip(video_path, upload_id: str, clip: dict,
                 f"fps=30,crop={crop_w}:{src_h}:{crop_x}:0,"
                 f"scale=1080:1920:flags=lanczos[vbase]")
     else:
+        # Blur-fill background, blurred at QUARTER resolution (Phase 6
+        # fix, 15 Nov 2026): blurring full 1080x1920 at sigma=40 was
+        # part of a ~520 MB ffmpeg footprint that OOM-killed Render
+        # Free (512 MB). The background is blurred beyond recognition
+        # anyway, so downscale → blur sigma=10 → upscale gives the
+        # same look for ~1/4 of the blur memory (measured: -15 MB
+        # alone; combined with the x264 tuning below, -270 MB).
         base = (f"[0:v]trim=start={rel_start}:end={rel_end},setpts=PTS-STARTPTS,"
                 f"fps=30,split=2[bg0][fg0];"
-                "[bg0]scale=1080:1920:force_original_aspect_ratio=increase,"
-                "crop=1080:1920,gblur=sigma=40[bg];"
+                "[bg0]scale=270:480:force_original_aspect_ratio=increase,"
+                "crop=270:480,gblur=sigma=10,scale=1080:1920[bg];"
                 "[fg0]scale=1080:-2[fg];"
                 "[bg][fg]overlay=(W-w)/2:(H-h)/2[vbase]")
 
@@ -471,12 +478,29 @@ def render_clip(video_path, upload_id: str, clip: dict,
         raise RuntimeError("FFmpeg install karo — render nahi ho sakta")
     # Input -ss only (fast keyframe seek); precise cut is in-filter.
     # NEVER put -ss/-t after -i here — see the cutting-gotcha note above.
+    # Thread caps + x264 tuning (Phase 6 fix, 15 Nov 2026): the stock
+    # command (preset medium, uncapped threads) peaked at ~520 MB RSS
+    # for the ffmpeg child alone — on Render Free (512 MB) that
+    # OOM-killed the container mid-render. Bisected on a 10s window
+    # of the same clip (local ffmpeg): medium/threads2 = 520 MB;
+    # blur-downscale = 505 MB (blur was NOT the hog); veryfast +
+    # rc-lookahead=10:ref=2 = 329 MB; + blur-downscale + threads=1
+    # = 252 MB; veryfast + rc-lookahead=5:ref=1 + blur-downscale +
+    # threads=1 = 220 MB. Quality check vs the medium original:
+    # SSIM 0.9956, PSNR 45.8 dB, file 1.76 vs 1.89 MB — visually
+    # transparent at the same CRF 18. superfast was rejected
+    # (170 MB but 3.3x file size). 1 thread is right for a 0.1-CPU
+    # container; local renders also got ~2x faster (147s -> 75s).
     cmd = [ffmpeg, "-y", "-v", "error",
+           "-threads", "1",
            "-ss", str(seek),
            "-i", str(video_path),
            "-filter_complex", filter_complex,
+           "-filter_threads", "1", "-filter_complex_threads", "1",
            "-map", "[vout]", "-map", "[aout]",
-           "-c:v", "libx264", "-preset", "medium", "-crf", "18",
+           "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+           "-x264-params", "rc-lookahead=5:ref=1",
+           "-threads", "1",
            "-pix_fmt", "yuv420p",
            "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
            "-movflags", "+faststart", str(mp4_path)]

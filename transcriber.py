@@ -38,6 +38,7 @@ Behaviour:
 """
 from __future__ import annotations
 
+import gc
 import json
 import os
 import re
@@ -208,6 +209,7 @@ def transcribe(video_path, upload_id: str, model_name: str | None = None,
 
     tmp_dir = Path(tempfile.gettempdir())
     wav_path = tmp_dir / f"vcs_{upload_id}.wav"
+    model = None
     try:
         extract_audio(video_path, wav_path)
         model = _load_model(model_name)
@@ -240,6 +242,23 @@ def transcribe(video_path, upload_id: str, model_name: str | None = None,
         text = " ".join(s["text"] for s in segments).strip()
     finally:
         wav_path.unlink(missing_ok=True)
+        # Free the model NOW (Phase 6 fix, 15 Nov 2026): the
+        # CTranslate2 model holds ~150 MB + inference arenas. On a
+        # 512 MB Render instance the next step (render = FFmpeg child
+        # + opencv) OOM-killed the container when this memory was
+        # still held. del + gc.collect() drops RSS back near baseline
+        # before the caller renders.
+        if model is not None:
+            del model
+            gc.collect()
+            # Return freed arenas to the OS (Linux/glibc only,
+            # best-effort): without this, CPython keeps the model's
+            # freed blocks in-process and RSS barely drops.
+            try:
+                import ctypes
+                ctypes.CDLL("libc.so.6").malloc_trim(0)
+            except Exception:
+                pass
 
     # Fallback: if word timestamps came back empty, rebuild words from
     # segments by splitting on spaces — timestamps are then

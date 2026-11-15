@@ -17,6 +17,7 @@ Phase 6 (not yet): GitHub + Render deploy (needs user's GitHub username).
 """
 from __future__ import annotations
 
+import asyncio
 import io
 import os
 import sqlite3
@@ -263,9 +264,15 @@ async def transcribe_endpoint(
     if not video_path.is_file():
         raise HTTPException(status_code=404, detail="uploaded file missing on disk")
     try:
-        result = transcribe(video_path, upload_id, model_name=model or None,
-                            initial_prompt=initial_prompt or None,
-                            language=language or "en")
+        # CPU work runs in a worker thread (Phase 6 fix, 15 Nov 2026):
+        # a sync transcribe inside this async endpoint blocked the
+        # event loop for minutes — /health hung and Render's proxy
+        # cut the client connection while the server was still
+        # working. to_thread keeps the loop (and /health) responsive.
+        result = await asyncio.to_thread(
+            transcribe, video_path, upload_id, model_name=model or None,
+            initial_prompt=initial_prompt or None,
+            language=language or "en")
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc))
     except ValueError as exc:
@@ -319,8 +326,10 @@ async def find_clips_endpoint(
         transcript = load_transcript(upload_id)
     except FileNotFoundError:
         try:
-            transcript = transcribe(video_path, upload_id,
-                                    language=language or "en")
+            # Same worker-thread rule as /transcribe (see above).
+            transcript = await asyncio.to_thread(
+                transcribe, video_path, upload_id,
+                language=language or "en")
         except RuntimeError as exc:
             raise HTTPException(status_code=503, detail=str(exc))
         except ValueError as exc:
@@ -350,8 +359,9 @@ async def render_clip_endpoint(
 ) -> dict:
     """Render ONE clip to 1080x1920 with captions + grading.
 
-    Synchronous — a ~47s clip takes 1-3 min on CPU. Returns render
-    metadata (paths, resolution, caption script, reframe mode, etc.).
+    Runs in a worker thread (asyncio.to_thread) — a ~47s clip takes
+    1-3 min on CPU. Returns render metadata (paths, resolution,
+    caption script, reframe mode, etc.).
     """
     row = _get_upload_row(upload_id)
     if not row:
@@ -373,9 +383,12 @@ async def render_clip_endpoint(
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
     try:
-        meta = render_clip(video_path, upload_id, clip,
-                           style_name=style_name or "global-baatien",
-                           transcript=transcript)
+        # Worker thread, same reason as /transcribe (see above) —
+        # a ~47s clip takes 1-3 min on CPU.
+        meta = await asyncio.to_thread(
+            render_clip, video_path, upload_id, clip,
+            style_name=style_name or "global-baatien",
+            transcript=transcript)
     except (FileNotFoundError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except RuntimeError as exc:
@@ -684,8 +697,9 @@ async def render_all_endpoint(
     GUARD: works ONLY after at least one test clip was approved
     (POST /approve-clip). Without approval -> 400
     "Pehle 1 test clip approve karo". Already-rendered clips (sidecar
-    upload_id matches) are skipped, not re-rendered. Synchronous —
-    each clip takes 1-3 min on CPU, so a 4-clip video takes ~8 min.
+    upload_id matches) are skipped, not re-rendered. Each clip runs
+    in a worker thread — 1-3 min on CPU per clip, so a 4-clip video
+    takes ~8 min; /health stays responsive throughout.
     """
     row = _get_upload_row(upload_id)
     if not row:
@@ -720,9 +734,11 @@ async def render_all_endpoint(
                             "duration_sec": existing.get("duration_sec")})
             continue
         try:
-            meta = render_clip(video_path, upload_id, clip,
-                               style_name=style_name or "global-baatien",
-                               transcript=transcript)
+            # Worker thread, same reason as /transcribe (see above).
+            meta = await asyncio.to_thread(
+                render_clip, video_path, upload_id, clip,
+                style_name=style_name or "global-baatien",
+                transcript=transcript)
             results.append({"clip_id": cid, "status": "rendered",
                             "output_mp4": meta.get("output_mp4"),
                             "duration_sec": meta.get("duration_sec"),
