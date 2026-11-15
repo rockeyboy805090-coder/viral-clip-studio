@@ -1,6 +1,6 @@
 # Viral Clip Studio
 
-Local-first video clipping app, built in phases. **Current status: Phase 5 COMPLETE (fresh end-to-end verified live, 14 Nov 2026).**
+Local-first video clipping app, built in phases. **Current status: Phase 6 COMPLETE — live on Render Free since 15 Nov 2026 (https://viral-clip-studio-iy6g.onrender.com, `/health` = `{"status":"ok","phase":5}`). GitHub: https://github.com/rockeyboy805090-coder/viral-clip-studio (public).**
 
 ## Language rule — DEFAULT: ENGLISH (user correction, Phase 4)
 

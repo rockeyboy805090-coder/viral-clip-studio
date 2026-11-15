@@ -1,4 +1,5 @@
-# Phase 6 (NOT deployed yet): Render Free web service for Viral Clip Studio.
+# Phase 6 (DEPLOYED 15 Nov 2026): Render Free web service for Viral Clip Studio.
+# Live: https://viral-clip-studio-iy6g.onrender.com — service srv-dbsio0ui0phs73d8v610, Blueprint-managed, branch main.
 # Deploy: push this repo to GitHub, connect it in Render, free plan, no card.
 # Env vars to set in the Render dashboard (never commit real keys):
 #   GEMINI_API_KEY=<free key, optional>  WHISPER_LANGUAGE=en  WHISPER_MODEL=base
