@@ -58,15 +58,57 @@ the real work):
   Otherwise the standalone binary is used, else plain module.
   Locally (this VM) the venv module + impersonation also fixes
   the MITM-proxy SSL failure (libcurl honours SSL_CERT_FILE).
+- Round 3 (15 Nov 2026): yt-dlp STILL 403s from Render's datacenter
+  IP, so a DIFFERENT download route is now the fallback — Invidious
+  (public API instance, no key): GET /api/v1/videos/<id> returns
+  direct googlevideo stream URLs, which are downloaded and merged
+  with ffmpeg. Cobalt was TESTED and is NOT wired in: the official
+  api.cobalt.tools now needs a JWT (Turnstile) auth key, and every
+  community instance tried (co.eepy.au, cobalt.canine.tools,
+  cobalt-api.kwiatekmiki.pl) returned empty/unreachable from this
+  VM; the public instance lists are closed (opt-in only). Piped was
+  also TESTED and is NOT wired in: piped.video, pipedapi.kavin.rocks,
+  pipedapi-libre.kavin.rocks, pipedapi.adminforge.de,
+  pipedapi.leptons.xyz, pipedapi.reallyaweso.me, api-piped.mha.fi,
+  pipedapi.osphost.org — all dead/empty from this VM. Invidious
+  (yt.chocolatemoo53.com, the ONLY api:true instance in the public
+  list) VERIFIED working locally 15 Nov 2026: 720p60 mp4 + m4a AAC
+  streams returned, merged with ffmpeg, ffprobe-valid. Honest limit:
+  a single community instance is fragile, and nobody has proven the
+  googlevideo URLs work from Render's IP yet — local success does
+  NOT prove live success. Order: yt-dlp first, Invidious second;
+  the winner is recorded in result["downloader"]. Env knob
+  VCS_DOWNLOADERS (default "ytdlp,invidious") lets a test force one
+  route, e.g. VCS_DOWNLOADERS=invidious.
+- Round 3 JS-warning fix: the "web" player-client entry used to pass
+  NO --extractor-args at all, so the last probe fell back to yt-dlp's
+  DEFAULT client selection — the ONLY code path that can print the
+  "No supported JavaScript runtime ... deprecated" warning when no
+  runtime is detected. It now passes player_client=web explicitly,
+  like every other client. Belt and braces: known warning lines
+  (JS runtime, challenge solving, SABR) are filtered OUT of the
+  user-facing error message — warnings are not the error — while
+  the FULL stderr tail is kept in result["download_stderr_tail"]
+  for diagnostics.
+- Round 3 vanished-job fix: the job row is written to SQLite BEFORE
+  the worker thread starts (create_youtube_job, in app.py), so a
+  restart mid-download leaves a record when the disk survives. On
+  Render Free the disk itself is wiped on restart, so the record can
+  still vanish — the real fix is the UI: a 404 on poll now shows a
+  plain Hinglish "server restart ho gaya, dobara submit karo"
+  message instead of raw JSON.
 """
 from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
 import sys
+import urllib.error
+import urllib.request
 import uuid
 from contextlib import closing
 from datetime import datetime, timezone
@@ -343,10 +385,25 @@ def youtube_runtime_diagnostics() -> dict:
     """Cheap cached diagnostics for /health and job records."""
     node = _find_node()
     return {"node_found": node,
+            "js_runtimes_arg": _js_runtime_args(),
             "yt_dlp_version": _yt_dlp_version(),
             "curl_cffi": _curl_cffi_available(),
             "impersonation": _impersonation_target(),
-            "yt_dlp_cmd": " ".join(_yt_dlp_cmd())}
+            "yt_dlp_cmd": " ".join(_yt_dlp_cmd()),
+            "downloaders": _downloaders_enabled()}
+
+
+def _downloaders_enabled() -> list[str]:
+    """Download routes for this process (env knob, default both).
+
+    VCS_DOWNLOADERS=invidious forces the fallback (used by tests);
+    VCS_DOWNLOADERS=ytdlp forces yt-dlp only. Unknown names are
+    ignored; an empty list falls back to both routes.
+    """
+    raw = os.environ.get("VCS_DOWNLOADERS", "ytdlp,invidious")
+    out = [p.strip().lower() for p in raw.split(",")
+           if p.strip().lower() in ("ytdlp", "invidious")]
+    return out or ["ytdlp", "invidious"]
 
 
 # --- Player-client fallback + JS runtime + impersonation (round 2) --
@@ -380,7 +437,12 @@ _PLAYER_CLIENTS: tuple[tuple[str, list[str]], ...] = (
                       "youtube:player_client=mediaconnect"]),
     ("web_safari", ["--extractor-args",
                     "youtube:player_client=web_safari"]),
-    ("web", []),
+    # Round 3: web MUST pass its client explicitly too. It used to
+    # be [] — with no player_client arg yt-dlp falls back to DEFAULT
+    # client selection, the only path that can print the "No
+    # supported JavaScript runtime ... deprecated" warning when no
+    # runtime is detected. Explicit web keeps every probe identical.
+    ("web", ["--extractor-args", "youtube:player_client=web"]),
 )
 _PROBE_TIMEOUT = 120  # seconds per player-client probe attempt
 
@@ -471,15 +533,270 @@ def _is_blocked(tail: str) -> bool:
             or "failed to extract any player response" in low)
 
 
+_WARNING_LINE_MARKERS = ("javascript runtime", "challenge solving failed",
+                        "some formats may be missing", "sabr-only")
+
+
+def _clean_tail(tail: str) -> str:
+    """Drop known yt-dlp WARNING lines from a user-facing error tail.
+
+    Warnings are not the error: the JS-runtime deprecation, the
+    n/sig challenge-solving and the SABR-experiment warnings all
+    show up in stderr even when the real failure is a plain 403,
+    and they confuse the user (and look like a second bug). The
+    full unfiltered tail is kept in the job result's
+    download_stderr_tail for diagnostics — nothing is hidden.
+    """
+    kept = []
+    for line in (tail or "").splitlines():
+        low = line.lower()
+        if any(m in low for m in _WARNING_LINE_MARKERS):
+            continue
+        kept.append(line)
+    return "\n".join(kept).strip()
+
+
 def _download_failed_message(tail: str) -> str:
     """Plain Hinglish failure message (+ yt-dlp tail for debugging)."""
-    tail = (tail or "").strip()[-500:]
+    tail = _clean_tail((tail or "").strip()[-500:])
     if _is_blocked(tail):
         return ("YouTube ne is server ko block kar diya hai (bot-check / 403) — "
                 "thodi der baad phir try karo, ya video file upload karke V1 flow "
                 f"use karo. yt-dlp: {tail or 'no error text'}")
     return ("YouTube video download nahi ho paya — video private, removed, "
             f"age-restricted ya bot-check ho sakta hai. yt-dlp: {tail or 'no error text'}")
+
+
+class _DownloadError(RuntimeError):
+    """Download failure that also carries the FULL stderr tail.
+
+    The message shown to the user is the cleaned one; the worker
+    copies full_tail into the job result for diagnostics.
+    """
+
+    def __init__(self, message: str, full_tail: str = ""):
+        super().__init__(message)
+        self.full_tail = full_tail or ""
+
+
+# --- Invidious fallback (round 3) ---------------------------------
+# Cobalt and Piped were both tested on 15 Nov 2026 and are NOT
+# usable from this VM (see module docstring), so the fallback is
+# Invidious: a public API instance returns direct googlevideo.com
+# stream URLs for a video id — no yt-dlp, no YouTube player API,
+# no key. Only ONE api:true instance exists in the public list
+# (api.invidious.io/instances.json, checked 15 Nov 2026):
+# yt.chocolatemoo53.com (uptime 99.978). That single instance is
+# the fragility of this route, stated plainly.
+_INVIDIOUS_INSTANCES: tuple[str, ...] = (
+    "https://yt.chocolatemoo53.com",
+)
+_HTTP_UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+           "(KHTML, like Gecko) Chrome/126.0 Safari/537.36")
+_INVIDIOUS_API_TIMEOUT = 60
+_INVIDIOUS_DL_TIMEOUT = 1800  # a 720p video stream can be big
+
+
+def _http_get_json(url: str, timeout: int = 60) -> dict:
+    req = urllib.request.Request(url, headers={"User-Agent": _HTTP_UA,
+                                              "Accept": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(
+            f"Invidious API error: HTTP {exc.code} on {url}") from exc
+    except Exception as exc:
+        raise RuntimeError(f"Invidious API unreachable ({url}): {exc}") from exc
+
+
+def _http_download(url: str, dest: Path, timeout: int = 1800) -> int:
+    """Stream a URL to disk. Returns bytes written; raises on failure.
+
+    Verifies the byte count against the response Content-Length
+    (googlevideo URLs carry clen=... and a Content-Length header):
+    a mid-stream connection cut looks like a CLEAN EOF to urllib
+    (chunked reads just stop), so without this check a truncated
+    download silently becomes a 9-second "video" — verified 15 Nov
+    2026, first Invidious test merged to 9.03s of a 282s video.
+    One retry on truncation, then a loud failure.
+    """
+    for attempt in range(2):
+        req = urllib.request.Request(url, headers={"User-Agent": _HTTP_UA})
+        total = 0
+        expected: int | None = None
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp, \
+                    dest.open("wb") as out:
+                try:
+                    expected = int(resp.headers.get("Content-Length") or 0) or None
+                except (TypeError, ValueError):
+                    expected = None
+                while True:
+                    chunk = resp.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    out.write(chunk)
+                    total += len(chunk)
+        except Exception as exc:
+            dest.unlink(missing_ok=True)
+            if attempt == 0:
+                continue
+            raise RuntimeError(f"Stream download fail ho gaya: {exc}") from exc
+        if expected is not None and total < expected:
+            dest.unlink(missing_ok=True)
+            if attempt == 0:
+                continue
+            raise RuntimeError(
+                f"Stream download adhura raha ({total}/{expected} bytes) — "
+                "connection beech me toot gaya")
+        if total < 10_000:
+            dest.unlink(missing_ok=True)
+            raise RuntimeError(
+                f"Stream download bahut chhota raha ({total} bytes) — link expired ho sakta hai")
+        return total
+    raise RuntimeError("Stream download fail ho gaya")
+
+
+def _pick_invidious_streams(data: dict) -> tuple[dict | None, dict | None, dict | None]:
+    """Best <=720p mp4 streams from an Invidious /videos response.
+
+    Returns (muxed, video_only, audio). Muxed (formatStreams) is
+    preferred when present; YouTube rarely ships muxed >=360p now,
+    so the usual path is video-only mp4 (avc1) + audio m4a (AAC).
+    """
+    def height(fmt: dict) -> int:
+        # "720p60" -> 720 (leading digits only — a naive digit-strip
+        # would read 72060 and reject the 720p stream entirely).
+        label = str(fmt.get("qualityLabel") or "")
+        m = re.match(r"\s*(\d+)", label)
+        return int(m.group(1)) if m else 0
+
+    muxed = None
+    for fmt in data.get("formatStreams") or []:
+        if fmt.get("container") == "mp4" and fmt.get("url") \
+                and 0 < height(fmt) <= 720:
+            if muxed is None or height(fmt) > height(muxed):
+                muxed = fmt
+    video = None
+    for fmt in data.get("adaptiveFormats") or []:
+        if not str(fmt.get("type", "")).startswith("video"):
+            continue
+        if fmt.get("container") != "mp4" or "avc1" not in str(fmt.get("type", "")):
+            continue
+        if not fmt.get("url") or not (0 < height(fmt) <= 720):
+            continue
+        if video is None or height(fmt) > height(video):
+            video = fmt
+    audio = None
+    for fmt in data.get("adaptiveFormats") or []:
+        if not str(fmt.get("type", "")).startswith("audio"):
+            continue
+        # Invidious reports AAC audio as container "m4a" (type
+        # audio/mp4; codecs="mp4a.40.2") — accept mp4 and m4a.
+        if fmt.get("container") not in ("mp4", "m4a") \
+                or "mp4a" not in str(fmt.get("type", "")):
+            continue
+        if not fmt.get("url"):
+            continue
+        if audio is None or int(fmt.get("bitrate") or 0) > int(audio.get("bitrate") or 0):
+            audio = fmt
+    return muxed, video, audio
+
+
+def _merge_av(video_file: Path, audio_file: Path, out: Path) -> None:
+    """ffmpeg merge video-only + audio into one mp4 (copy first)."""
+    from utils import ffmpeg_status  # local import: avoids cycles
+
+    ffmpeg = ffmpeg_status().get("path") or "ffmpeg"
+    cmd = [ffmpeg, "-y", "-i", str(video_file), "-i", str(audio_file),
+           "-c", "copy", "-shortest", str(out)]
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
+    if r.returncode != 0:
+        # Copy failed (codec/container mismatch) — re-encode audio.
+        cmd = [ffmpeg, "-y", "-i", str(video_file), "-i", str(audio_file),
+               "-c:v", "copy", "-c:a", "aac", "-shortest", str(out)]
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
+    if r.returncode != 0:
+        raise RuntimeError(
+            "Invidious streams merge nahi ho paye (ffmpeg): "
+            f"{(r.stderr or '')[-300:]}")
+
+
+def _download_via_invidious(video_id: str, job_dir: Path) -> tuple[Path, dict]:
+    """Download a YouTube video through a public Invidious instance.
+
+    Returns (video_path, info dict with title/duration). Raises
+    RuntimeError with a plain message on any failure — the caller
+    turns it into the job's failed message.
+    """
+    job_dir.mkdir(parents=True, exist_ok=True)
+    last_err = ""
+    for base in _INVIDIOUS_INSTANCES:
+        try:
+            data = _http_get_json(
+                f"{base}/api/v1/videos/{video_id}",
+                timeout=_INVIDIOUS_API_TIMEOUT)
+        except RuntimeError as exc:
+            last_err = str(exc)
+            continue
+        title = str(data.get("title") or "youtube video")
+        duration = data.get("lengthSeconds")
+        muxed, video, audio = _pick_invidious_streams(data)
+        try:
+            if muxed is not None:
+                out = job_dir / "video.mp4"
+                _http_download(str(muxed["url"]), out,
+                               timeout=_INVIDIOUS_DL_TIMEOUT)
+                return out, {"title": title, "duration": duration}
+            if video is None:
+                raise RuntimeError(
+                    "Invidious ne <=720p mp4 video stream nahi diya")
+            if audio is None:
+                raise RuntimeError(
+                    "Invidious ne mp4 audio stream nahi diya")
+            v_file = job_dir / "video_only.mp4"
+            a_file = job_dir / "audio_only.m4a"
+            _http_download(str(video["url"]), v_file,
+                           timeout=_INVIDIOUS_DL_TIMEOUT)
+            _http_download(str(audio["url"]), a_file, timeout=600)
+            out = job_dir / "video.mp4"
+            _merge_av(v_file, a_file, out)
+            v_file.unlink(missing_ok=True)
+            a_file.unlink(missing_ok=True)
+            # Duration check: a silently truncated stream must fail
+            # LOUDLY here, not become a 9s video downstream (see
+            # _http_download note — verified 15 Nov 2026).
+            from utils import probe_video  # local import: avoids cycles
+
+            probe = probe_video(out)
+            if not probe["valid"]:
+                raise RuntimeError(
+                    f"Invidious merge valid nahi hai: {probe['error']}")
+            expected_dur = float(duration or 0)
+            if expected_dur > 0 and probe["duration"] < 0.9 * expected_dur:
+                raise RuntimeError(
+                    f"Invidious download adhura raha: merged video "
+                    f"{probe['duration']:.1f}s hai, expected "
+                    f"{expected_dur:.1f}s")
+            return out, {"title": title, "duration": duration}
+        except RuntimeError as exc:
+            last_err = str(exc)
+            continue
+    raise RuntimeError(
+        "Invidious fallback bhi fail ho gaya — "
+        f"{last_err or 'koi stream nahi mila'}")
+
+
+def _video_id_from_url(url: str) -> str:
+    """Extract the 11-char video id (validate_youtube_url already ran)."""
+    parsed = urlparse(url)
+    q = parse_qs(parsed.query)
+    vid = (q.get("v") or [""])[0]
+    if vid:
+        return vid
+    parts = [p for p in parsed.path.split("/") if p]
+    return parts[1] if len(parts) >= 2 else parts[0] if parts else ""
 
 
 def _probe_video(url: str) -> tuple[dict, str, list[str]]:
@@ -511,15 +828,12 @@ def _probe_video(url: str) -> tuple[dict, str, list[str]]:
     raise RuntimeError(_download_failed_message(last_tail))
 
 
-def _download_video(url: str, job_dir: Path) -> tuple[Path, dict, str, list[str]]:
-    """Download a YouTube video to <job_dir>/video.mp4 (best <=720p).
+def _download_via_ytdlp(url: str, job_dir: Path) -> tuple[Path, dict, str, list[str]]:
+    """yt-dlp download (probe clients in order, then download).
 
-    Probes with the player-client fallback first, then downloads
-    with the winning client. If that download itself hits a 403,
-    the remaining clients are retried (900s each); a non-403
-    download error is not retried — another client won't fix it.
     Returns (video_path, info_dict, winning_client, clients_tried).
-    Raises RuntimeError with a plain Hinglish message on failure.
+    Raises _DownloadError (cleaned user message + full stderr tail)
+    on failure.
     """
     job_dir.mkdir(parents=True, exist_ok=True)
     _check_yt_dlp_installed()
@@ -548,18 +862,62 @@ def _download_video(url: str, job_dir: Path) -> tuple[Path, dict, str, list[str]
         if not _is_blocked(last_tail):
             break  # non-403 error: retrying another client won't help
     else:
-        raise RuntimeError(_download_failed_message(last_tail))
+        raise _DownloadError(_download_failed_message(last_tail), last_tail)
     if dl is None or dl.returncode != 0:
-        raise RuntimeError(_download_failed_message(last_tail))
+        raise _DownloadError(_download_failed_message(last_tail), last_tail)
     video_path = job_dir / "video.mp4"
     if not video_path.is_file():
         # yt-dlp sometimes keeps another extension when merge fails.
         cands = sorted(job_dir.glob("video.*"))
         if not cands:
-            raise RuntimeError(
-                "yt-dlp chala par video file nahi mili — download adhura raha.")
+            raise _DownloadError(
+                "yt-dlp chala par video file nahi mili — download adhura raha.",
+                last_tail)
         video_path = cands[0]
     return video_path, info, client, tried
+
+
+def _download_video(url: str, job_dir: Path) -> tuple[Path, dict, str | None, list[str], str]:
+    """Download a YouTube video to <job_dir>/video.mp4 (best <=720p).
+
+    Route order (round 3): yt-dlp first (all player clients), then
+    the Invidious fallback when yt-dlp fails. Returns
+    (video_path, info_dict, winning_client_or_None, clients_tried,
+    downloader) where downloader is "yt-dlp" or "invidious".
+    Raises RuntimeError with a plain Hinglish message when every
+    route fails.
+    """
+    job_dir.mkdir(parents=True, exist_ok=True)
+    routes = _downloaders_enabled()
+    ytdlp_err: _DownloadError | None = None
+    if "ytdlp" in routes:
+        try:
+            video_path, info, client, tried = _download_via_ytdlp(url, job_dir)
+            return video_path, info, client, tried, "yt-dlp"
+        except _DownloadError as exc:
+            ytdlp_err = exc
+        except RuntimeError as exc:
+            # _probe_video raises plain RuntimeError (already a clean
+            # Hinglish message); keep it the same way.
+            ytdlp_err = _DownloadError(str(exc), str(exc))
+    if "invidious" in routes:
+        try:
+            video_path, info = _download_via_invidious(
+                _video_id_from_url(url), job_dir)
+            return video_path, info, None, [], "invidious"
+        except RuntimeError as exc:
+            inv_err = str(exc)
+            base = (str(ytdlp_err) if ytdlp_err else
+                    "yt-dlp route try nahi hua")
+            err = _DownloadError(
+                f"{base} — aur Invidious fallback bhi fail: {inv_err}. "
+                "Thodi der baad phir try karo, ya video file upload karke "
+                "V1 flow use karo.",
+                (ytdlp_err.full_tail if ytdlp_err else "")[:2000])
+            raise err from exc
+    if ytdlp_err is not None:
+        raise ytdlp_err
+    raise RuntimeError("Koi download route enabled nahi hai (VCS_DOWNLOADERS dekho)")
 
 
 def _register_download(video_path: Path, title: str) -> dict:
@@ -626,22 +984,27 @@ def run_youtube_job(job_id: str) -> None:
                     message="YouTube se video download ho raha hai…",
                     result=result)
         job_dir = YT_DIR / job_id
-        video_path, info, client, tried = _download_video(job["url"], job_dir)
+        video_path, info, client, tried, downloader = _download_video(
+            job["url"], job_dir)
         title = str(info.get("title") or "youtube video")
         duration = info.get("duration")
         if duration:
             result["video_duration_sec"] = round(float(duration), 1)
         result["video_title"] = title
-        result["player_client"] = client
-        result["clients_tried"] = tried
-        result["impersonation"] = result["diagnostics"].get("impersonation")
+        result["downloader"] = downloader
+        if client:
+            result["player_client"] = client
+            result["clients_tried"] = tried
+            result["impersonation"] = result["diagnostics"].get("impersonation")
+        dl_note = (f"player client: {client}" if client
+                   else f"downloader: {downloader}")
 
         # --- register as a normal upload/project ---
         upload = _register_download(video_path, title)
         upload_id = upload["id"]
         result["upload_id"] = upload_id
         _update_job(job_id, upload_id=upload_id, result=result,
-                    message=f"Download ho gaya (player client: {client}, "
+                    message=f"Download ho gaya ({dl_note}, "
                             f"{upload['duration_sec']}s) — "
                             "ab transcribe ho raha hai…")
 
@@ -729,7 +1092,12 @@ def run_youtube_job(job_id: str) -> None:
                             "ZIP download ke liye ready hai.",
                     result=result)
     except Exception as exc:
-        # Honest failure: keep whatever partial result exists.
+        # Honest failure: keep whatever partial result exists. The
+        # FULL yt-dlp stderr tail (warnings included) is kept in
+        # the result for diagnostics; the user-facing message
+        # already had the warning lines filtered out.
+        if isinstance(exc, _DownloadError) and exc.full_tail:
+            result["download_stderr_tail"] = exc.full_tail[:2000]
         _update_job(job_id, status="failed",
                     message=f"Job fail ho gaya: {str(exc)[:600]}",
                     result=result)

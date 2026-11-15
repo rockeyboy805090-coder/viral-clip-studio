@@ -473,7 +473,11 @@ async function pollYtJob(jobId){
   const b = await r.json();
   const el = document.querySelector('#yt-status');
   el.classList.remove('hidden');
-  if (!r.ok) { el.textContent = 'Error: ' + JSON.stringify(b); el.classList.add('text-red-300'); if (ytTimer) clearInterval(ytTimer); return; }
+  // Round 3: server restart hone par job record kho sakta hai (Render
+  // Free ka disk ephemeral hai) — tab 404 aata hai. Raw JSON dikhane
+  // ke bajay saaf Hinglish message dikhao aur dobara submit karne ko bolo.
+  if (r.status === 404) { el.textContent = 'Server restart ho gaya — job kho gaya. Dobara submit karo: link phir se paste karke Clips Banao dabao.'; el.classList.add('text-red-300'); if (ytTimer) clearInterval(ytTimer); return; }
+  if (!r.ok) { el.textContent = 'Error: ' + (b.detail || JSON.stringify(b)); el.classList.add('text-red-300'); if (ytTimer) clearInterval(ytTimer); return; }
   el.textContent = 'Status: ' + b.status + ' — ' + (b.message || '');
   el.classList.toggle('text-red-300', b.status === 'failed');
   const res = b.result || {};
