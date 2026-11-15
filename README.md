@@ -2,6 +2,24 @@
 
 Local-first video clipping app, built in phases. **Current status: Phase 6 COMPLETE — live on Render Free since 15 Nov 2026 (https://viral-clip-studio-iy6g.onrender.com, `/health` = `{"status":"ok","phase":5}`). GitHub: https://github.com/rockeyboy805090-coder/viral-clip-studio (public).**
 
+## V2 (16 Nov 2026) — YouTube link se clips, automatic
+
+**User order:** "Kisi bhi video ki link du, uski sari clips viral wali nikaal kar edit karke direct mujhko de de — main sirf video ki link dunga."
+
+**UI:** homepage ke top par "YouTube Link se Clips Banao (V2)" section — URL input, language selector (default English), clips 1-8 (default 8), "Clips Banao" button. Job status har 10 sec me poll hota hai; done hote hi clip list + Download ZIP button dikhta hai. V1 sections (upload, style, transcribe, render, batch, history) untouched hain.
+
+**API:**
+- `POST /youtube-job` — body `{"url": "<youtube link>", "language": "en", "top_n": 8}`. Sirf youtube.com / youtu.be links allowed — baaki sab 400. Turant `{"job_id", "status": "queued"}` return karta hai; poora kaam background thread me chalta hai.
+- `GET /youtube-job/{job_id}` — status (`queued|downloading|transcribing|finding_clips|rendering|done|failed`), progress message, aur done hone par: `upload_id`, transcript word count, clips (id/score/duration/hook), `download_zip_url` (`/download/<upload_id>/all`). Job state SQLite table `youtube_jobs` me persist hoti hai.
+
+**Job flow (worker, `youtube_job.py`):** yt-dlp download (best ≤720p mp4, per-job dir `yt_downloads/<job_id>/`) → normal upload/project ki tarah register (ffprobe validation ke saath) → transcribe (faster-whisper, language from request) → find-clips (top_n) → test clip render → approve → render-all → ZIP ready. Existing internal functions reuse hote hain (transcribe / find_clips / render_clip / set_clip_approval) — pipeline logic duplicate nahi ki gayi.
+
+**Limits (honest):**
+- YouTube datacenter IPs (Render) se download par bot-check lag sakta hai ("Sign in to confirm you're not a bot") — job `failed` hoga aur yt-dlp ka exact error tail status me milega. Local VM par download kaam karta hai.
+- Lambi video = lamba job: pehla transcribe model download karta hai, har clip render 1-3 min. Job thread me chalta hai — `/health` beech me bhi answer karta hai.
+- Server restart ho jaye mid-job to job apne last stage par atka dikhega — completion fake nahi ki jati.
+- FO588 proof (15 Nov 2026): 142-min video → 25,946 words → 8 clips (scores 69-74) → 8 verified renders (1080x1920 yuv420p) + 121 MB ZIP. Ye manual pipeline se hua tha; V2 wahi pipeline automatic chalata hai.
+
 ## Phase 6 fix (15 Nov 2026) — faster-whisper replaces openai-whisper
 
 Live `/transcribe` CRASHED the Render Free instance twice (openai-whisper + torch need ~2 GB RAM; Render Free has 512 MB). The service restarted and the uploaded project was lost (ephemeral storage). Fix: `transcriber.py` now uses **faster-whisper** (CTranslate2, CPU int8, no torch) — same Whisper model names (`tiny`/`base`/`small`), same word timestamps, same transcript JSON/TXT format, same `WHISPER_LANGUAGE`/`WHISPER_MODEL` env vars. `requirements.txt` no longer lists openai-whisper (torch is gone — do NOT re-add it). First transcribe downloads the base model (~150 MB) from HuggingFace, then it is cached. Local + live re-test numbers are in the Phase 6 fix section at the end of this README.
@@ -275,7 +293,7 @@ Local re-test (same 118.9s English test video, upload `cf004e3bd8924162b832b5ca2
 | `POST /find-clips` | ✅ 3 clips (scores 63/49/40, rule-based, `en`) — Phase 5 had 2 clips (61/45); small difference from faster-whisper segment boundaries, not a regression |
 | `POST /render-clip clip_01` | ✅ 2m20s, 49.03s, 1080x1920, h264, yuv420p, 30fps, AAC, 8,660,854 bytes, SRT 0 non-Latin chars, sidecar JSON present |
 | Live re-test (1st attempt, 15 Nov 2026) | ⚠️ **Transcribe FIXED, render CRASHED**: upload OK (88s cold start), transcribe completed on-server — 304 words, engine faster-whisper, `en`/`latin`, 0 non-Latin chars — BUT the client connection was cut at ~4m30s (Render proxy) and /health hung for ~12 min because the sync transcribe blocked the event loop; render then 502'd at 56s and the instance restarted, wiping the project (ephemeral storage). Root cause: (a) event-loop blocking, (b) ffmpeg render peaked at ~520 MB alone (x264 medium lookahead) — see "Render OOM fix" below. Fixed in code (to_thread + model free + render memory diet) and re-tested locally; 2nd live test pending after push. |
-| Live re-test (2nd attempt) | (fill in after Render auto-deploy of the render-OOM fix) |
+| Live re-test (2nd attempt, 15 Nov 2026) | ✅ **FULL END-TO-END PASS, no crash**: upload 746b1d65… (118.9s, 3.7s); transcribe completed server-side in ~668s (~11 min, first use incl. ~150 MB model download + 0.1 CPU) — **304 words**, engine faster-whisper, `en`/`latin`, 0 non-Latin chars, real word timestamps; **/health answered 24/24 times DURING the transcribe** (to_thread fix — was 0/0, hung); client connection cut at 277s by Render proxy but transcript was saved, retrieved via `GET /transcript/{id}`; find-clips 2 clips (57/48, rule-based, `en`); render clip_01 completed server-side in ~6 min — 49.08s, 1080x1920, h264, yuv420p, 30fps, AAC, 8,281,261 bytes, SRT 0 non-Latin chars, blur_fill + zoom, frame eyeballed (blurred fill + green/white karaoke OK); project ZIP 200, 8,209,039 bytes, 6 files; project status `test_rendered`, no restart, nothing lost. **Live link now works end to end.** Remaining honest limits: first transcribe is slow (~11 min) and the proxy cuts the response — poll for the transcript; a crash would still wipe the project + model cache (ephemeral storage). |
 
 ## Render OOM fix (15 Nov 2026) — second live crash, same root cause (memory)
 

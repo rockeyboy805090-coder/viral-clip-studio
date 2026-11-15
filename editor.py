@@ -150,12 +150,27 @@ def detect_face_centre(video_path: Path, start: float, end: float) -> dict:
             faces = cascade.detectMultiScale(gray, scaleFactor=1.1,
                                              minNeighbors=5, minSize=(60, 60))
             if len(faces):
-                out["frames_with_face"] += 1
-                # Largest face = main speaker.
-                x, y, w, h = max(faces, key=lambda r: r[2] * r[3])
+                # Largest face = main speaker — but ignore detections whose
+                # centre sits in the bottom band (centre_y > 0.72). Proven
+                # 15 Nov 2026 on FO588 clip_04: the Haar cascade fired a
+                # persistent FALSE POSITIVE on the desk mug at (0.11, 0.84)
+                # in 10/11 frames, outvoting the one real face at
+                # (0.63, 0.45); the median locked centre_crop onto the mug
+                # and the speaker was out of frame for the whole clip. A
+                # seated speaker's face centre is in the upper 2/3.
+                cands = []
                 fh, fw = frame.shape[:2]
-                centres_x.append((x + w / 2) / fw)
-                centres_y.append((y + h / 2) / fh)
+                for (x, y, w, h) in faces:
+                    cx, cy = (x + w / 2) / fw, (y + h / 2) / fh
+                    if cy <= 0.72:
+                        cands.append((x, y, w, h, cx, cy))
+                if not cands:
+                    t += 2.0
+                    continue
+                out["frames_with_face"] += 1
+                x, y, w, h, cx, cy = max(cands, key=lambda r: r[2] * r[3])
+                centres_x.append(cx)
+                centres_y.append(cy)
                 widths.append(w / fw)
             t += 2.0
         cap.release()

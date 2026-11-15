@@ -10,3 +10,7 @@ opencv-python>=4.10,<5.0
 # no CUDA) — safe on Render Free. Do NOT re-add openai-whisper/torch.
 faster-whisper>=1.0,<2.0
 google-generativeai>=0.8,<1.0
+# V2 (16 Nov 2026) — YouTube download for POST /youtube-job:
+# yt-dlp (pip package ships the `yt-dlp` binary; youtube_job.py falls
+# back to `python -m yt_dlp` if the binary is not on PATH). Free, no key.
+yt-dlp>=2024.8,<2027

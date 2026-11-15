@@ -14,6 +14,10 @@ Phase 4 (new): workflow / history / batch / test-clip approval —
 Phase 5 (new): download/share — per-clip + whole-project ZIPs,
   caption JSON for copy, share guide; per-upload render namespace.
 Phase 6 (not yet): GitHub + Render deploy (needs user's GitHub username).
+V2 (16 Nov 2026): YouTube link -> fully edited clips, automatically —
+  POST /youtube-job + GET /youtube-job/{id} (background worker in
+  youtube_job.py: yt-dlp download -> transcribe -> find-clips ->
+  render test clip -> approve -> render-all -> project ZIP).
 """
 from __future__ import annotations
 
@@ -21,6 +25,7 @@ import asyncio
 import io
 import os
 import sqlite3
+import threading
 import uuid
 import zipfile
 from contextlib import asynccontextmanager, closing
@@ -43,6 +48,9 @@ from workflow import (create_batch, delete_project, get_batch,
                       is_clip_rendered_for_upload, list_projects,
                       list_rendered_for_upload, run_batch,
                       set_clip_approval)
+from youtube_job import (create_youtube_job, get_youtube_job,
+                         init_youtube_jobs_table, run_youtube_job,
+                         validate_youtube_url)
 
 try:
     from dotenv import load_dotenv  # type: ignore
@@ -75,7 +83,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Viral Clip Studio", version="0.5.0-phase5", lifespan=lifespan)
+app = FastAPI(title="Viral Clip Studio", version="0.6.0-v2", lifespan=lifespan)
 
 
 def init_db() -> None:
@@ -93,6 +101,7 @@ def init_db() -> None:
         )""")
         conn.commit()
     init_workflow_tables()
+    init_youtube_jobs_table()
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -792,6 +801,48 @@ async def create_batch_endpoint(
 def get_batch_endpoint(batch_id: str) -> dict:
     try:
         return get_batch(batch_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+
+# ---------------------------------------------------------- V2: YouTube job
+
+@app.post("/youtube-job")
+async def create_youtube_job_endpoint(payload: dict) -> dict:
+    """Start a full YouTube -> clips job. Returns at once; poll status.
+
+    Body: {"url": "<youtube link>", "language": "en", "top_n": 8}.
+    Language default English; top_n 1-8 (default 8). Only youtube.com /
+    youtu.be links are accepted — anything else is 400.
+    The worker (daemon thread) downloads with yt-dlp, transcribes,
+    finds clips, renders a test clip, approves it, renders the rest,
+    and leaves the project ZIP ready. Poll GET /youtube-job/{job_id}.
+    """
+    url = str(payload.get("url") or "")
+    try:
+        clean_url = validate_youtube_url(url)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    language = str(payload.get("language") or "en")
+    try:
+        top_n = int(payload.get("top_n") or 8)
+    except (TypeError, ValueError):
+        top_n = 8
+    job = create_youtube_job(clean_url, language=language, top_n=top_n)
+    thread = threading.Thread(target=run_youtube_job, args=(job["job_id"],),
+                              daemon=True)
+    thread.start()
+    return {"job_id": job["job_id"], "status": "queued",
+            "message": "YouTube job queued — download se lekar render tak "
+                       "background me chalega. GET /youtube-job/{job_id} se "
+                       "progress dekho."}
+
+
+@app.get("/youtube-job/{job_id}")
+def get_youtube_job_endpoint(job_id: str) -> dict:
+    """Job status + progress + (when done) clips and ZIP link."""
+    try:
+        return get_youtube_job(job_id)
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
 
