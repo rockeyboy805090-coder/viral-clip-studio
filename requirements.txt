@@ -1,0 +1,14 @@
+fastapi>=0.115,<1.0
+uvicorn[standard]>=0.30,<1.0
+python-multipart>=0.0.9,<1.0
+python-dotenv>=1.0,<2.0
+opencv-python>=4.10,<5.0
+# Phase 2 — Whisper (local, offline) + Gemini (free API, key optional):
+# NOTE: openai-whisper pulls torch. Do NOT install torch from PyPI on a
+# CPU-only machine — that wheel bundles ~2.5 GB of NVIDIA CUDA libs.
+# Install CPU-only torch FIRST (see README), then this file: pip will
+# see torch already satisfied and skip the CUDA download. Without
+# Whisper installed, the app still runs, but /transcribe returns a
+# clear "Whisper install karo" error instead of a fake transcript.
+openai-whisper>=20240930
+google-generativeai>=0.8,<1.0

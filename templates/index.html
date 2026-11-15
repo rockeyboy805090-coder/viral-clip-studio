@@ -1,0 +1,441 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Viral Clip Studio — Phase 5</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>body{background:#09090b;color:#f4f4f5} .drop{border:1px dashed #52525b}</style>
+</head>
+<body class="min-h-screen">
+  <main class="mx-auto max-w-3xl px-5 py-12">
+    <p class="text-sm font-semibold uppercase tracking-[.2em] text-violet-400">Phase 5 · Download ZIP + Caption Copy + Share Guide</p>
+    <h1 class="mt-3 text-4xl font-bold">Viral Clip Studio</h1>
+    <p class="mt-3 text-zinc-400">Long video upload karo, Whisper se transcript banao, viral clips dhoondho, phir ek test clip render karo — 9:16, captions, color grading, Global Baatien style.</p>
+    <ol class="mt-5 flex flex-wrap gap-2 text-xs font-semibold">
+      <li class="rounded-full bg-violet-600 px-3 py-1">1 Upload</li>
+      <li class="rounded-full bg-zinc-800 px-3 py-1">2 Style</li>
+      <li class="rounded-full bg-zinc-800 px-3 py-1">3 Transcribe</li>
+      <li class="rounded-full bg-zinc-800 px-3 py-1">4 Find Clips</li>
+      <li class="rounded-full bg-zinc-800 px-3 py-1">5 Render Test Clip</li>
+      <li class="rounded-full bg-zinc-800 px-3 py-1">6 Approve</li>
+      <li class="rounded-full bg-zinc-800 px-3 py-1">7 Render All</li>
+      <li class="rounded-full bg-zinc-800 px-3 py-1">8 Download</li>
+    </ol>
+
+    <form id="upload-form" class="mt-8 space-y-5 rounded-2xl border border-zinc-800 bg-zinc-900/70 p-6">
+      <label class="block">
+        <span class="mb-2 block font-medium">Long video <span class="text-zinc-500">(MP4 or MOV)</span></span>
+        <input class="drop block w-full rounded-xl bg-zinc-950 p-4 text-sm" type="file" name="long_video" accept="video/mp4,video/quicktime,.mp4,.mov" required>
+      </label>
+      <label class="block">
+        <span class="mb-2 block font-medium">Reference video <span class="text-zinc-500">(optional)</span></span>
+        <input class="drop block w-full rounded-xl bg-zinc-950 p-4 text-sm" type="file" name="reference_video" accept="video/mp4,video/quicktime,.mp4,.mov">
+      </label>
+      <button class="w-full rounded-xl bg-violet-600 px-5 py-3 font-semibold hover:bg-violet-500" type="submit">Save uploads</button>
+      <pre id="result" class="hidden overflow-auto whitespace-pre-wrap rounded-lg bg-black p-4 text-sm text-zinc-300"></pre>
+    </form>
+
+    <section class="mt-6 rounded-2xl border border-zinc-800 bg-zinc-900/70 p-6">
+      <h2 class="text-xl font-semibold">Style Extractor — Reference se Style Card banao</h2>
+      <p class="mt-2 text-sm text-zinc-400">Reference video upload karo, style name do, Extract dabao. Neeche Style Card dikhega — naam aur caption color badal sakte ho, phir Approve dabao.</p>
+      <form id="extract-form" class="mt-4 space-y-4">
+        <label class="block">
+          <span class="mb-2 block font-medium">Reference video <span class="text-zinc-500">(MP4 or MOV)</span></span>
+          <input class="drop block w-full rounded-xl bg-zinc-950 p-4 text-sm" type="file" name="reference_video" accept="video/mp4,video/quicktime,.mp4,.mov" required>
+        </label>
+        <label class="block">
+          <span class="mb-2 block font-medium">Style name</span>
+          <input class="block w-full rounded-xl bg-zinc-950 p-3 text-sm" type="text" name="style_name" value="Extracted Style" required>
+        </label>
+        <button class="w-full rounded-xl bg-emerald-600 px-5 py-3 font-semibold hover:bg-emerald-500" type="submit">Extract Style</button>
+      </form>
+      <div id="style-card" class="mt-5 hidden rounded-xl border border-zinc-700 bg-black p-4">
+        <h3 class="font-semibold">Style Card</h3>
+        <div class="mt-3 grid grid-cols-2 gap-3 text-sm">
+          <label class="block">Style name <input id="sc-name" class="mt-1 block w-full rounded-lg bg-zinc-900 p-2"></label>
+          <label class="block">Caption color <input id="sc-color" class="mt-1 block w-full rounded-lg bg-zinc-900 p-2"></label>
+          <label class="block">Highlight color <input id="sc-highlight" class="mt-1 block w-full rounded-lg bg-zinc-900 p-2"></label>
+          <label class="block">Caption size (px) <input id="sc-size" type="number" class="mt-1 block w-full rounded-lg bg-zinc-900 p-2"></label>
+          <label class="block">Cut every (sec) <input id="sc-cut" type="number" step="0.1" class="mt-1 block w-full rounded-lg bg-zinc-900 p-2"></label>
+          <label class="block">Contrast <input id="sc-contrast" type="number" step="0.01" class="mt-1 block w-full rounded-lg bg-zinc-900 p-2"></label>
+          <label class="block">Saturation <input id="sc-sat" type="number" step="0.01" class="mt-1 block w-full rounded-lg bg-zinc-900 p-2"></label>
+          <label class="block">Color tone <input id="sc-tone" class="mt-1 block w-full rounded-lg bg-zinc-900 p-2"></label>
+        </div>
+        <pre id="sc-json" class="mt-3 overflow-auto whitespace-pre-wrap rounded-lg bg-zinc-950 p-3 text-xs text-zinc-300"></pre>
+        <button id="approve-btn" class="mt-3 w-full rounded-xl bg-violet-600 px-5 py-3 font-semibold hover:bg-violet-500" type="button">Approve &amp; Save Style</button>
+        <p id="approve-msg" class="mt-2 text-sm text-emerald-400"></p>
+      </div>
+      <pre id="extract-result" class="mt-3 hidden overflow-auto whitespace-pre-wrap rounded-lg bg-black p-4 text-sm text-zinc-300"></pre>
+    </section>
+
+    <section class="mt-6 rounded-2xl border border-zinc-800 bg-zinc-900/70 p-6">
+      <h2 class="text-xl font-semibold">Find Viral Clips — Transcript + Top Clips</h2>
+      <p class="mt-2 text-sm text-zinc-400">Upload ke baad mila hua <b>upload id</b> yahan daalo. Pehle Transcribe dabao (Whisper local, thoda time lagega), phir Find Clips dabao. Gemini key nahi hai to rule-based scoring hogi — ye list me saaf likha aayega.</p>
+      <form id="clip-form" class="mt-4 space-y-4">
+        <label class="block">
+          <span class="mb-2 block font-medium">Long video upload id</span>
+          <input id="clip-upload-id" class="block w-full rounded-xl bg-zinc-950 p-3 text-sm" type="text" placeholder="upload ke baad mila id yahan paste karo" required>
+        </label>
+        <label class="block">
+          <span class="mb-2 block font-medium">Top clips kitne chahiye? (1-8)</span>
+          <input id="clip-topn" class="block w-full rounded-xl bg-zinc-950 p-3 text-sm" type="number" min="1" max="8" value="5">
+        </label>
+        <label class="block">
+          <span class="mb-2 block font-medium">Language — Default: English</span>
+          <select id="clip-language" class="block w-full rounded-xl bg-zinc-950 p-3 text-sm">
+            <option value="en" selected>English</option>
+            <option value="hinglish">Hinglish (Roman)</option>
+            <option value="hi">Hindi</option>
+          </select>
+          <span class="mt-1 block text-xs text-zinc-500">Captions English words me aayenge. Hindi audio ho to transcript Hindi me hi aayega — English me convert nahi hota, English captions ke liye English audio chahiye.</span>
+        </label>
+        <div class="flex gap-3">
+          <button id="transcribe-btn" class="flex-1 rounded-xl bg-sky-600 px-5 py-3 font-semibold hover:bg-sky-500" type="button">1. Transcribe</button>
+          <button id="findclips-btn" class="flex-1 rounded-xl bg-emerald-600 px-5 py-3 font-semibold hover:bg-emerald-500" type="button">2. Find Viral Clips</button>
+        </div>
+      </form>
+      <pre id="clip-result" class="mt-3 hidden overflow-auto whitespace-pre-wrap rounded-lg bg-black p-4 text-sm text-zinc-300"></pre>
+      <div id="clips-list" class="mt-4 space-y-3"></div>
+    </section>
+
+    <section class="mt-6 rounded-2xl border border-zinc-800 bg-zinc-900/70 p-6">
+      <h2 class="text-xl font-semibold">Render 1 Test Clip — 9:16 Reel banao</h2>
+      <p class="mt-2 text-sm text-zinc-400">Pehle 1 test clip render karo, dekho, phir baaki clips. Render me 1-3 min lag sakte hain (CPU). Style default: Global Baatien. Captions transcript ki bhasha me honge — default English.</p>
+      <form id="render-form" class="mt-4 space-y-4">
+        <label class="block">
+          <span class="mb-2 block font-medium">Long video upload id</span>
+          <input id="render-upload-id" class="block w-full rounded-xl bg-zinc-950 p-3 text-sm" type="text" placeholder="upload id" required>
+        </label>
+        <label class="block">
+          <span class="mb-2 block font-medium">Clip id (jaise clip_01)</span>
+          <input id="render-clip-id" class="block w-full rounded-xl bg-zinc-950 p-3 text-sm" type="text" value="clip_01" required>
+        </label>
+        <label class="block">
+          <span class="mb-2 block font-medium">Style</span>
+          <input id="render-style" class="block w-full rounded-xl bg-zinc-950 p-3 text-sm" type="text" value="global-baatien">
+        </label>
+        <button class="w-full rounded-xl bg-rose-600 px-5 py-3 font-semibold hover:bg-rose-500" type="submit">Render 1 Test Clip</button>
+      </form>
+      <pre id="render-result" class="mt-3 hidden overflow-auto whitespace-pre-wrap rounded-lg bg-black p-4 text-sm text-zinc-300"></pre>
+      <div id="render-preview" class="mt-4 hidden">
+        <video id="render-video" class="mx-auto w-64 rounded-xl border border-zinc-700" controls playsinline></video>
+        <div class="mt-3 flex gap-3">
+          <a id="dl-mp4" class="flex-1 rounded-xl bg-violet-600 px-4 py-2 text-center font-semibold" href="#" download>Download MP4</a>
+          <a id="dl-srt" class="flex-1 rounded-xl bg-zinc-800 px-4 py-2 text-center font-semibold" href="#" download>Download SRT</a>
+        </div>
+        <div class="mt-3 flex gap-3">
+          <a id="dl-zip" class="flex-1 rounded-xl bg-emerald-600 px-4 py-2 text-center font-semibold" href="#" download>Download ZIP (MP4+SRT+Caption)</a>
+          <button id="copy-caption-btn" class="flex-1 rounded-xl bg-zinc-800 px-4 py-2 font-semibold" type="button">Copy Caption + Hashtags</button>
+        </div>
+        <p id="copy-msg" class="mt-2 text-sm text-emerald-400"></p>
+        <p class="mt-2 text-xs text-zinc-500">Post karne ke liye: <a class="text-violet-400 underline" href="/share-guide">Share Guide</a> dekho — direct auto-post nahi hai, download karke phone se post karo.</p>
+      </div>
+    </section>
+
+    <section class="mt-6 rounded-2xl border border-zinc-800 bg-zinc-900/70 p-6">
+      <h2 class="text-xl font-semibold">Approve + Render All — Test clip pehle, baaki baad me</h2>
+      <p class="mt-2 text-sm text-zinc-400">Pehle 1 test clip render karo aur dekho. Pasand aaye to <b>Approve</b> dabao — tabhi Render All chalega. Bina approve ke Render All 400 error dega: "Pehle 1 test clip approve karo".</p>
+      <form id="approve-form" class="mt-4 space-y-4">
+        <label class="block">
+          <span class="mb-2 block font-medium">Long video upload id</span>
+          <input id="approve-upload-id" class="block w-full rounded-xl bg-zinc-950 p-3 text-sm" type="text" placeholder="upload id" required>
+        </label>
+        <label class="block">
+          <span class="mb-2 block font-medium">Clip id (jaise clip_01)</span>
+          <input id="approve-clip-id" class="block w-full rounded-xl bg-zinc-950 p-3 text-sm" type="text" value="clip_01" required>
+        </label>
+        <label class="block">
+          <span class="mb-2 block font-medium">Style (Render All ke liye)</span>
+          <input id="renderall-style" class="block w-full rounded-xl bg-zinc-950 p-3 text-sm" type="text" value="global-baatien">
+        </label>
+        <div class="flex gap-3">
+          <button id="approve-clip-btn" class="flex-1 rounded-xl bg-emerald-600 px-5 py-3 font-semibold hover:bg-emerald-500" type="button">Approve Test Clip</button>
+          <button id="reject-clip-btn" class="flex-1 rounded-xl bg-zinc-700 px-5 py-3 font-semibold hover:bg-zinc-600" type="button">Reject</button>
+          <button id="renderall-btn" class="flex-1 rounded-xl bg-rose-600 px-5 py-3 font-semibold hover:bg-rose-500" type="button">Render All Clips</button>
+        </div>
+      </form>
+      <pre id="approve-result" class="mt-3 hidden overflow-auto whitespace-pre-wrap rounded-lg bg-black p-4 text-sm text-zinc-300"></pre>
+      <div class="mt-4">
+        <button id="project-status-btn" class="rounded-xl bg-sky-600 px-5 py-2 font-semibold hover:bg-sky-500" type="button">Project Status dekho</button>
+        <pre id="project-status" class="mt-3 hidden overflow-auto whitespace-pre-wrap rounded-lg bg-black p-4 text-sm text-zinc-300"></pre>
+      </div>
+    </section>
+
+    <section class="mt-6 rounded-2xl border border-zinc-800 bg-zinc-900/70 p-6">
+      <h2 class="text-xl font-semibold">Batch — Kai videos ek saath</h2>
+      <p class="mt-2 text-sm text-zinc-400">2-10 upload ids comma se alag karke daalo. Batch sirf transcribe + find-clips karega (background me). Render ke liye har video ka test clip alag se approve karna padega.</p>
+      <form id="batch-form" class="mt-4 space-y-4">
+        <label class="block">
+          <span class="mb-2 block font-medium">Upload ids (comma se alag)</span>
+          <input id="batch-ids" class="block w-full rounded-xl bg-zinc-950 p-3 text-sm" type="text" placeholder="id1, id2" required>
+        </label>
+        <label class="block">
+          <span class="mb-2 block font-medium">Style</span>
+          <input id="batch-style" class="block w-full rounded-xl bg-zinc-950 p-3 text-sm" type="text" value="global-baatien">
+        </label>
+        <label class="block">
+          <span class="mb-2 block font-medium">Language — Default: English</span>
+          <select id="batch-language" class="block w-full rounded-xl bg-zinc-950 p-3 text-sm">
+            <option value="en" selected>English</option>
+            <option value="hinglish">Hinglish (Roman)</option>
+            <option value="hi">Hindi</option>
+          </select>
+        </label>
+        <button class="w-full rounded-xl bg-violet-600 px-5 py-3 font-semibold hover:bg-violet-500" type="submit">Start Batch</button>
+      </form>
+      <pre id="batch-result" class="mt-3 hidden overflow-auto whitespace-pre-wrap rounded-lg bg-black p-4 text-sm text-zinc-300"></pre>
+      <button id="batch-poll-btn" class="mt-3 hidden rounded-xl bg-sky-600 px-5 py-2 font-semibold hover:bg-sky-500" type="button">Batch Progress dekho</button>
+    </section>
+
+    <section class="mt-6 rounded-2xl border border-zinc-800 bg-zinc-900/70 p-6">
+      <h2 class="text-xl font-semibold">History — Purane Projects</h2>
+      <p class="mt-2 text-sm text-zinc-400">Sab uploads, unka status, clips aur renders. Download yahin se karo. Delete karne se us project ki files (upload, transcript, clips, uske renders) delete hongi — dusre project ki files ko haath nahi lagega.</p>
+      <button id="refresh-projects" class="mt-3 rounded-xl bg-zinc-800 px-5 py-2 font-semibold" type="button">Refresh History</button>
+      <div id="projects-list" class="mt-4 space-y-3"></div>
+    </section>
+
+    <section class="mt-6 rounded-xl border border-zinc-800 p-5 text-sm text-zinc-400">
+      <h2 class="font-semibold text-white">Saved Styles</h2>
+      <button id="refresh-styles" class="mt-2 rounded-lg bg-zinc-800 px-3 py-2 text-white" type="button">Refresh list</button>
+      <ul id="style-list" class="mt-3 list-disc pl-5"></ul>
+      <p class="mt-3">Phase 5 status: download ZIP, caption copy aur share guide live. Pehle 1 test clip render karo, approve karo, phir Render All, phir ZIP download karo.</p>
+      <a class="mt-3 inline-block text-violet-400 underline" href="/health">Check app health</a>
+      <a class="mt-3 ml-4 inline-block text-violet-400 underline" href="/share-guide">Share Guide — Instagram / Facebook par kaise post karein</a>
+    </section>
+  </main>
+<script>
+let currentProfile = null;
+async function showJson(el, obj, ok=true){ el.textContent = JSON.stringify(obj, null, 2); el.classList.remove('hidden'); el.classList.toggle('text-red-300', !ok); }
+const uploadForm = document.querySelector('#upload-form');
+uploadForm.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const btn = uploadForm.querySelector('button'); btn.disabled = true; btn.textContent = 'Uploading…';
+  try { const r = await fetch('/upload', {method:'POST', body:new FormData(uploadForm)}); const b = await r.json(); await showJson(document.querySelector('#result'), b, r.ok); }
+  catch (err) { await showJson(document.querySelector('#result'), {error: String(err)}, false); }
+  finally { btn.disabled = false; btn.textContent = 'Save uploads'; }
+});
+const extractForm = document.querySelector('#extract-form');
+extractForm.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const btn = extractForm.querySelector('button'); btn.disabled = true; btn.textContent = 'Extracting…';
+  try {
+    const r = await fetch('/extract-style', {method:'POST', body:new FormData(extractForm)});
+    const b = await r.json();
+    await showJson(document.querySelector('#extract-result'), b, r.ok);
+    if (r.ok && b.profile) {
+      currentProfile = b.profile;
+      document.querySelector('#style-card').classList.remove('hidden');
+      document.querySelector('#sc-name').value = b.profile.style_name;
+      document.querySelector('#sc-color').value = b.profile.caption_color;
+      document.querySelector('#sc-highlight').value = b.profile.highlight_color;
+      document.querySelector('#sc-size').value = b.profile.caption_size_px;
+      document.querySelector('#sc-cut').value = b.profile.cut_every_seconds;
+      document.querySelector('#sc-contrast').value = b.profile.contrast;
+      document.querySelector('#sc-sat').value = b.profile.saturation;
+      document.querySelector('#sc-tone').value = b.profile.color_tone;
+      document.querySelector('#sc-json').textContent = JSON.stringify(b.profile, null, 2);
+      refreshStyles();
+    }
+  } catch (err) { await showJson(document.querySelector('#extract-result'), {error: String(err)}, false); }
+  finally { btn.disabled = false; btn.textContent = 'Extract Style'; }
+});
+document.querySelector('#approve-btn').addEventListener('click', async () => {
+  if (!currentProfile) return;
+  currentProfile.style_name = document.querySelector('#sc-name').value;
+  currentProfile.caption_color = document.querySelector('#sc-color').value;
+  currentProfile.highlight_color = document.querySelector('#sc-highlight').value;
+  currentProfile.caption_size_px = parseInt(document.querySelector('#sc-size').value, 10);
+  currentProfile.cut_every_seconds = parseFloat(document.querySelector('#sc-cut').value);
+  currentProfile.contrast = parseFloat(document.querySelector('#sc-contrast').value);
+  currentProfile.saturation = parseFloat(document.querySelector('#sc-sat').value);
+  currentProfile.color_tone = document.querySelector('#sc-tone').value;
+  const r = await fetch('/styles', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(currentProfile)});
+  const b = await r.json();
+  document.querySelector('#approve-msg').textContent = r.ok ? ('Saved: ' + b.file) : ('Error: ' + JSON.stringify(b));
+  document.querySelector('#sc-json').textContent = JSON.stringify(currentProfile, null, 2);
+  refreshStyles();
+});
+async function refreshStyles(){
+  const r = await fetch('/styles'); const b = await r.json();
+  const ul = document.querySelector('#style-list'); ul.innerHTML = '';
+  (b.styles || []).forEach(s => { const li = document.createElement('li'); li.textContent = s.name + ' (' + s.file + ')'; ul.appendChild(li); });
+}
+document.querySelector('#refresh-styles').addEventListener('click', refreshStyles);
+refreshStyles();
+// --- Phase 2: Transcribe + Find Clips ---
+function renderClips(data){
+  const box = document.querySelector('#clips-list'); box.innerHTML = '';
+  const head = document.createElement('p');
+  head.className = 'text-sm text-zinc-400';
+  head.textContent = 'Scoring: ' + (data.scoring_method || '?') + ' · language: ' + (data.scoring_language || 'en') + ' · ' + (data.clips || []).length + ' clips';
+  box.appendChild(head);
+  (data.clips || []).forEach(c => {
+    const div = document.createElement('div');
+    div.className = 'rounded-xl border border-zinc-700 bg-black p-4';
+    div.innerHTML =
+      '<label class="flex items-start gap-3"><input type="checkbox" checked class="mt-1 h-4 w-4">' +
+      '<span><b>' + c.clip_id + ' · Score ' + c.score + '/100</b> · ' + c.start + 's – ' + c.end + 's (' + c.duration + 's)<br>' +
+      '<span class="text-amber-300">Hook: ' + (c.hook_line || '') + '</span><br>' +
+      '<span class="text-zinc-400 text-sm">' + (c.reason || '') + '</span><br>' +
+      '<span class="text-zinc-300 text-sm">' + (c.transcript_text || '').slice(0, 300) + '</span></span></label>' +
+      '<div class="mt-3 flex gap-2"><button data-act="approve" data-cid="' + c.clip_id + '" class="rounded-lg bg-emerald-600 px-3 py-1 text-sm font-semibold">Approve</button>' +
+      '<button data-act="reject" data-cid="' + c.clip_id + '" class="rounded-lg bg-zinc-700 px-3 py-1 text-sm font-semibold">Reject</button></div>';
+    box.appendChild(div);
+  });
+  box.querySelectorAll('button[data-act]').forEach(btn => btn.addEventListener('click', async () => {
+    const uid = document.querySelector('#clip-upload-id').value;
+    const url = btn.dataset.act === 'approve' ? '/approve-clip' : '/reject-clip';
+    const fd = new FormData(); fd.append('upload_id', uid); fd.append('clip_id', btn.dataset.cid);
+    const r = await fetch(url, {method: 'POST', body: fd});
+    const b = await r.json();
+    btn.textContent = r.ok ? (btn.dataset.act === 'approve' ? 'Approved ✓' : 'Rejected') : 'Error';
+    const el = document.querySelector('#clip-result');
+    el.textContent = JSON.stringify(b, null, 2); el.classList.remove('hidden');
+  }));
+}
+async function postForm(url, fields){
+  const fd = new FormData();
+  Object.entries(fields).forEach(([k, v]) => fd.append(k, v));
+  const r = await fetch(url, {method: 'POST', body: fd});
+  const b = await r.json();
+  const el = document.querySelector('#clip-result');
+  el.textContent = JSON.stringify(b, null, 2);
+  el.classList.remove('hidden');
+  el.classList.toggle('text-red-300', !r.ok);
+  if (r.ok && b.clips) renderClips(b);
+  return {r, b};
+}
+document.querySelector('#transcribe-btn').addEventListener('click', async (e) => {
+  const btn = e.target; btn.disabled = true; btn.textContent = 'Transcribing… (Whisper, time lagega)';
+  try { await postForm('/transcribe', {upload_id: document.querySelector('#clip-upload-id').value, language: document.querySelector('#clip-language').value}); }
+  finally { btn.disabled = false; btn.textContent = '1. Transcribe'; }
+});
+document.querySelector('#findclips-btn').addEventListener('click', async (e) => {
+  const btn = e.target; btn.disabled = true; btn.textContent = 'Finding clips…';
+  try { await postForm('/find-clips', {upload_id: document.querySelector('#clip-upload-id').value, top_n: document.querySelector('#clip-topn').value, language: document.querySelector('#clip-language').value}); }
+  finally { btn.disabled = false; btn.textContent = '2. Find Viral Clips'; }
+});
+// --- Phase 3: Render 1 Test Clip ---
+document.querySelector('#render-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const btn = e.target.querySelector('button'); btn.disabled = true; btn.textContent = 'Rendering… (1-3 min lag sakte hain)';
+  const el = document.querySelector('#render-result');
+  try {
+    const fd = new FormData();
+    fd.append('upload_id', document.querySelector('#render-upload-id').value);
+    fd.append('clip_id', document.querySelector('#render-clip-id').value);
+    fd.append('style_name', document.querySelector('#render-style').value);
+    const r = await fetch('/render-clip', {method: 'POST', body: fd});
+    const b = await r.json();
+    el.textContent = JSON.stringify(b, null, 2);
+    el.classList.remove('hidden');
+    el.classList.toggle('text-red-300', !r.ok);
+    if (r.ok) {
+      const cid = b.clip_id;
+      const uid = b.upload_id;
+      document.querySelector('#render-preview').classList.remove('hidden');
+      document.querySelector('#render-video').src = '/rendered/' + uid + '/' + cid;
+      document.querySelector('#dl-mp4').href = '/rendered/' + uid + '/' + cid;
+      document.querySelector('#dl-srt').href = '/rendered/' + uid + '/' + cid + '/srt';
+      document.querySelector('#dl-zip').href = '/download/' + uid + '/' + cid;
+      document.querySelector('#copy-caption-btn').dataset.uid = uid;
+      document.querySelector('#copy-caption-btn').dataset.cid = cid;
+    }
+  } catch (err) { el.textContent = String(err); el.classList.remove('hidden'); }
+  finally { btn.disabled = false; btn.textContent = 'Render 1 Test Clip'; }
+});
+// --- Phase 5: Copy Caption + Hashtags ---
+document.querySelector('#copy-caption-btn').addEventListener('click', async (e) => {
+  const btn = e.target;
+  const uid = btn.dataset.uid, cid = btn.dataset.cid;
+  const msg = document.querySelector('#copy-msg');
+  if (!uid || !cid) { msg.textContent = 'Pehle ek clip render karo.'; return; }
+  const r = await fetch('/caption/' + encodeURIComponent(uid) + '/' + encodeURIComponent(cid));
+  const b = await r.json();
+  if (!r.ok) { msg.textContent = 'Error: ' + JSON.stringify(b); return; }
+  try { await navigator.clipboard.writeText(b.full_text); msg.textContent = 'Caption copy ho gaya — Instagram / Facebook me paste karo.'; }
+  catch (err) { msg.textContent = 'Copy nahi hua, text: ' + b.full_text; }
+});
+// --- Phase 4: Approve / Reject / Render All / Project Status ---
+async function postFormTo(url, fields, outEl){
+  const fd = new FormData();
+  Object.entries(fields).forEach(([k, v]) => fd.append(k, v));
+  const r = await fetch(url, {method: 'POST', body: fd});
+  const b = await r.json();
+  outEl.textContent = JSON.stringify(b, null, 2);
+  outEl.classList.remove('hidden');
+  outEl.classList.toggle('text-red-300', !r.ok);
+  return {r, b};
+}
+document.querySelector('#approve-clip-btn').addEventListener('click', async (e) => {
+  const btn = e.target; btn.disabled = true; btn.textContent = 'Approving…';
+  try { await postFormTo('/approve-clip', {upload_id: document.querySelector('#approve-upload-id').value, clip_id: document.querySelector('#approve-clip-id').value}, document.querySelector('#approve-result')); }
+  finally { btn.disabled = false; btn.textContent = 'Approve Test Clip'; }
+});
+document.querySelector('#reject-clip-btn').addEventListener('click', async (e) => {
+  const btn = e.target; btn.disabled = true; btn.textContent = 'Rejecting…';
+  try { await postFormTo('/reject-clip', {upload_id: document.querySelector('#approve-upload-id').value, clip_id: document.querySelector('#approve-clip-id').value}, document.querySelector('#approve-result')); }
+  finally { btn.disabled = false; btn.textContent = 'Reject'; }
+});
+document.querySelector('#renderall-btn').addEventListener('click', async (e) => {
+  const btn = e.target; btn.disabled = true; btn.textContent = 'Rendering all… (har clip 1-3 min)';
+  try { await postFormTo('/render-all', {upload_id: document.querySelector('#approve-upload-id').value, style_name: document.querySelector('#renderall-style').value}, document.querySelector('#approve-result')); refreshProjects(); }
+  finally { btn.disabled = false; btn.textContent = 'Render All Clips'; }
+});
+document.querySelector('#project-status-btn').addEventListener('click', async () => {
+  const uid = document.querySelector('#approve-upload-id').value;
+  const el = document.querySelector('#project-status');
+  const r = await fetch('/projects/' + encodeURIComponent(uid));
+  const b = await r.json();
+  el.textContent = JSON.stringify(b, null, 2); el.classList.remove('hidden');
+  el.classList.toggle('text-red-300', !r.ok);
+});
+// --- Phase 4: Batch ---
+let lastBatchId = null;
+document.querySelector('#batch-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const el = document.querySelector('#batch-result');
+  const ids = document.querySelector('#batch-ids').value.split(',').map(s => s.trim()).filter(Boolean);
+  const r = await fetch('/batch', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({upload_ids: ids, style_name: document.querySelector('#batch-style').value, language: document.querySelector('#batch-language').value})});
+  const b = await r.json();
+  el.textContent = JSON.stringify(b, null, 2); el.classList.remove('hidden');
+  el.classList.toggle('text-red-300', !r.ok);
+  if (r.ok) { lastBatchId = b.batch_id; document.querySelector('#batch-poll-btn').classList.remove('hidden'); }
+});
+document.querySelector('#batch-poll-btn').addEventListener('click', async () => {
+  if (!lastBatchId) return;
+  const el = document.querySelector('#batch-result');
+  const r = await fetch('/batch/' + lastBatchId);
+  const b = await r.json();
+  el.textContent = JSON.stringify(b, null, 2); el.classList.remove('hidden');
+  refreshProjects();
+});
+// --- Phase 4: History ---
+async function refreshProjects(){
+  const box = document.querySelector('#projects-list'); box.innerHTML = '';
+  const r = await fetch('/projects'); const b = await r.json();
+  (b.projects || []).forEach(p => {
+    const div = document.createElement('div');
+    div.className = 'rounded-xl border border-zinc-700 bg-black p-4 text-sm';
+    const dl = (p.rendered_clips || []).map(cid => '<a class="text-violet-400 underline mr-3" href="/rendered/' + p.upload_id + '/' + cid + '" download>' + cid + '.mp4</a> <a class="text-emerald-400 underline mr-3" href="/download/' + p.upload_id + '/' + cid + '" download>' + cid + '.zip</a>').join('') || '<span class="text-zinc-500">koi render nahi</span>';
+    const dlAll = (p.rendered_clips || []).length ? ' <a class="text-emerald-400 underline" href="/download/' + p.upload_id + '/all" download>Download All (ZIP)</a>' : '';
+    div.innerHTML = '<b>' + (p.original_name || p.upload_id) + '</b> · <span class="text-emerald-400">' + p.status + '</span><br>' +
+      '<span class="text-zinc-400">clips: ' + p.clips_count + ' · approved: ' + (p.approved_clips || []).join(', ') + ' · rendered: ' + (p.rendered_clips || []).join(', ') + '</span><br>' +
+      '<span class="text-zinc-500 text-xs">' + p.upload_id + '</span><br>' + dl + dlAll +
+      ' <button data-del="' + p.upload_id + '" class="mt-2 rounded-lg bg-red-900 px-3 py-1 text-xs font-semibold">Delete Project</button>';
+    box.appendChild(div);
+  });
+  box.querySelectorAll('button[data-del]').forEach(btn => btn.addEventListener('click', async () => {
+    if (!confirm('Delete karun? Upload, transcript, clips aur iske renders delete honge: ' + btn.dataset.del)) return;
+    const r = await fetch('/projects/' + encodeURIComponent(btn.dataset.del), {method: 'DELETE'});
+    const b = await r.json();
+    alert(r.ok ? ('Deleted: ' + b.deleted_count + ' files') : ('Error: ' + JSON.stringify(b)));
+    refreshProjects();
+  }));
+}
+document.querySelector('#refresh-projects').addEventListener('click', refreshProjects);
+refreshProjects();
+</script>
+</body>
+</html>

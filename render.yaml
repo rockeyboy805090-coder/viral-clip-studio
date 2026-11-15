@@ -1,0 +1,20 @@
+# Phase 6 (NOT deployed yet): Render Free web service for Viral Clip Studio.
+# Deploy: push this repo to GitHub, connect it in Render, free plan, no card.
+# Env vars to set in the Render dashboard (never commit real keys):
+#   GEMINI_API_KEY=<free key, optional>  WHISPER_LANGUAGE=en  WHISPER_MODEL=base
+# NOTE: Render Free = 512 MB RAM, sleeps after 15 min idle, ~1 min cold start.
+# Whisper base + torch need ~2 GB at install; Render free build may be slow
+# or fail on memory — if it does, transcription will return the honest 503
+# and the rest of the app still works. Heavy rendering is for local laptop use.
+services:
+  - type: web
+    name: viral-clip-studio
+    env: python
+    plan: free
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "uvicorn app:app --host 0.0.0.0 --port $PORT"
+    envVars:
+      - key: WHISPER_LANGUAGE
+        value: en
+      - key: WHISPER_MODEL
+        value: base

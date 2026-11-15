@@ -1,0 +1,7 @@
+uploads/
+outputs/
+*.sqlite3
+.venv/
+__pycache__/
+.env
+.venv2/
