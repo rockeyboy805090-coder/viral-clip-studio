@@ -97,6 +97,26 @@ the real work):
   still vanish — the real fix is the UI: a 404 on poll now shows a
   plain Hinglish "server restart ho gaya, dobara submit karo"
   message instead of raw JSON.
+- Round 4 (15 Nov 2026, live job 1705a95b05db): the Invidious fallback
+  could NOT be proven from the live job record — no per-attempt
+  record, no invidious field, and the message was the pure yt-dlp
+  403. Root cause was INVISIBILITY, not (only) a short-circuit:
+  (a) run_youtube_job truncated the failure message to [:600]
+  chars, and the combined yt-dlp+Invidious message is ~820 chars
+  with the Invidious part starting past char 660 — so even when
+  the fallback ran and failed, its mention was cut off;
+  (b) clients_tried/player_client are only written on SUCCESS, and
+  nothing ever recorded a failed attempt; (c) download_stderr_tail
+  carries the yt-dlp tail only. Live timing (119.5s: fast-failing
+  probes + a ~60s Invidious connect timeout) is consistent with
+  the fallback having run and hung on an unreachable instance —
+  but nothing recorded it, so it could not be proven either way.
+  Fix: every probe/download/Invidious attempt is recorded in
+  result["attempts"] ({downloader, stage, client, status, error,
+  duration_s}); the Invidious outcome is recorded in
+  result["invidious"]; the combined user message is SHORT by
+  construction (one line naming each route tried); and /health
+  exposes live Invidious reachability from the server.
 """
 from __future__ import annotations
 
@@ -107,6 +127,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
 import uuid
@@ -390,7 +411,42 @@ def youtube_runtime_diagnostics() -> dict:
             "curl_cffi": _curl_cffi_available(),
             "impersonation": _impersonation_target(),
             "yt_dlp_cmd": " ".join(_yt_dlp_cmd()),
-            "downloaders": _downloaders_enabled()}
+            "downloaders": _downloaders_enabled(),
+            "invidious": _invidious_reachability()}
+
+
+_INVIDIOUS_REACH_CACHE: dict = {"at": 0.0, "value": None}
+
+
+def _invidious_reachability() -> dict:
+    """Is the Invidious instance reachable FROM THIS SERVER?
+
+    One quick GET to /api/v1/stats (5s timeout), cached 60s so
+    /health stays cheap. Round 4: the live job could not prove
+    whether the instance was reachable from Render at all — this
+    field answers that from the API alone, no server logs needed.
+    """
+    now = time.monotonic()
+    cached = _INVIDIOUS_REACH_CACHE["value"]
+    if cached is not None and now - _INVIDIOUS_REACH_CACHE["at"] < 60:
+        return cached
+    base = _INVIDIOUS_INSTANCES[0]
+    out: dict = {"instance": base, "reachable": False,
+                 "http_status": None, "error": None}
+    try:
+        req = urllib.request.Request(f"{base}/api/v1/stats",
+                                     headers={"User-Agent": _HTTP_UA,
+                                              "Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            out["http_status"] = resp.status
+            out["reachable"] = 200 <= resp.status < 300
+    except urllib.error.HTTPError as exc:
+        out["http_status"] = exc.code
+        out["error"] = f"HTTP {exc.code}"
+    except Exception as exc:
+        out["error"] = str(exc)[:120]
+    _INVIDIOUS_REACH_CACHE.update({"at": now, "value": out})
+    return out
 
 
 def _downloaders_enabled() -> list[str]:
@@ -571,12 +627,54 @@ class _DownloadError(RuntimeError):
     """Download failure that also carries the FULL stderr tail.
 
     The message shown to the user is the cleaned one; the worker
-    copies full_tail into the job result for diagnostics.
+    copies full_tail into the job result for diagnostics. Round 4:
+    it also carries `attempts` (every probe/download/Invidious
+    attempt tried) and `invidious` (the fallback's diagnostics) so
+    a failed job is diagnosable from the API record alone — the
+    round-3 code recorded NOTHING on failure, which is why live
+    job 1705a95b05db showed no sign the fallback ever ran.
     """
 
-    def __init__(self, message: str, full_tail: str = ""):
+    def __init__(self, message: str, full_tail: str = "",
+                 attempts: list[dict] | None = None,
+                 invidious: dict | None = None):
         super().__init__(message)
         self.full_tail = full_tail or ""
+        self.attempts = attempts or []
+        self.invidious = invidious
+
+
+class _InvidiousError(RuntimeError):
+    """Invidious failure carrying its diagnostics dict."""
+
+    def __init__(self, message: str, diag: dict | None = None):
+        super().__init__(message)
+        self.diag = diag or {}
+
+
+def _short_err(text: str) -> str:
+    """One-line summary of an error (<=120 chars) for the combined
+    user-facing message. The combined message must stay SHORT —
+    a 500-char yt-dlp tail used to push the Invidious part past
+    the message cap (round-4 bug)."""
+    low = (text or "").lower()
+    if "403" in (text or "") or "forbidden" in low:
+        return "HTTP 403 Forbidden (bot-check)"
+    if "failed to extract any player response" in low:
+        return "player response nahi mila"
+    if "unreachable" in low:
+        return "instance unreachable"
+    if "timed out" in low or "timeout" in low:
+        return "connection timeout"
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if "ERROR:" in line:
+            line = line.split("ERROR:", 1)[1].strip()
+        if line:
+            return line[:120]
+    return (text or "fail")[:120]
 
 
 # --- Invidious fallback (round 3) ---------------------------------
@@ -723,32 +821,50 @@ def _merge_av(video_file: Path, audio_file: Path, out: Path) -> None:
             f"{(r.stderr or '')[-300:]}")
 
 
-def _download_via_invidious(video_id: str, job_dir: Path) -> tuple[Path, dict]:
+def _download_via_invidious(video_id: str, job_dir: Path) -> tuple[Path, dict, dict]:
     """Download a YouTube video through a public Invidious instance.
 
-    Returns (video_path, info dict with title/duration). Raises
-    RuntimeError with a plain message on any failure — the caller
-    turns it into the job's failed message.
+    Returns (video_path, info dict with title/duration, diag dict).
+    diag = {tried, instance, http_status, error, streams_found,
+    duration_s}. Raises _InvidiousError (with .diag) on any failure
+    — the caller records the diag in the job result, so a failed
+    fallback is VISIBLE instead of silent (round 4).
     """
     job_dir.mkdir(parents=True, exist_ok=True)
+    t0 = time.monotonic()
     last_err = ""
+    last_diag: dict = {"tried": True,
+                       "instance": _INVIDIOUS_INSTANCES[0],
+                       "http_status": None, "error": None,
+                       "streams_found": False, "duration_s": None}
     for base in _INVIDIOUS_INSTANCES:
+        diag: dict = {"tried": True, "instance": base,
+                      "http_status": None, "error": None,
+                      "streams_found": False, "duration_s": None}
+        last_diag = diag
         try:
             data = _http_get_json(
                 f"{base}/api/v1/videos/{video_id}",
                 timeout=_INVIDIOUS_API_TIMEOUT)
+            diag["http_status"] = 200
         except RuntimeError as exc:
             last_err = str(exc)
+            m = re.search(r"HTTP (\d+)", last_err)
+            diag["http_status"] = int(m.group(1)) if m else None
+            diag["error"] = last_err[:200]
+            diag["duration_s"] = round(time.monotonic() - t0, 1)
             continue
         title = str(data.get("title") or "youtube video")
         duration = data.get("lengthSeconds")
         muxed, video, audio = _pick_invidious_streams(data)
+        diag["streams_found"] = bool(muxed or video)
         try:
             if muxed is not None:
                 out = job_dir / "video.mp4"
                 _http_download(str(muxed["url"]), out,
                                timeout=_INVIDIOUS_DL_TIMEOUT)
-                return out, {"title": title, "duration": duration}
+                diag["duration_s"] = round(time.monotonic() - t0, 1)
+                return out, {"title": title, "duration": duration}, diag
             if video is None:
                 raise RuntimeError(
                     "Invidious ne <=720p mp4 video stream nahi diya")
@@ -779,13 +895,17 @@ def _download_via_invidious(video_id: str, job_dir: Path) -> tuple[Path, dict]:
                     f"Invidious download adhura raha: merged video "
                     f"{probe['duration']:.1f}s hai, expected "
                     f"{expected_dur:.1f}s")
-            return out, {"title": title, "duration": duration}
+            diag["duration_s"] = round(time.monotonic() - t0, 1)
+            return out, {"title": title, "duration": duration}, diag
         except RuntimeError as exc:
             last_err = str(exc)
+            diag["error"] = last_err[:200]
+            diag["duration_s"] = round(time.monotonic() - t0, 1)
             continue
-    raise RuntimeError(
+    last_diag["duration_s"] = round(time.monotonic() - t0, 1)
+    raise _InvidiousError(
         "Invidious fallback bhi fail ho gaya — "
-        f"{last_err or 'koi stream nahi mila'}")
+        f"{last_err or 'koi stream nahi mila'}", diag=last_diag)
 
 
 def _video_id_from_url(url: str) -> str:
@@ -799,18 +919,23 @@ def _video_id_from_url(url: str) -> str:
     return parts[1] if len(parts) >= 2 else parts[0] if parts else ""
 
 
-def _probe_video(url: str) -> tuple[dict, str, list[str]]:
+def _probe_video(url: str) -> tuple[dict, str, list[str], list[dict]]:
     """--dump-json probe, trying player clients in order.
 
-    Returns (info_dict, winning_client, clients_tried). The probe is
-    the step that fails with 403 on a blocked IP ("Failed to extract
-    any player response"), so it is the step that needs the fallback.
-    Raises RuntimeError (plain Hinglish) when every client fails.
+    Returns (info_dict, winning_client, clients_tried, attempts).
+    The probe is the step that fails with 403 on a blocked IP
+    ("Failed to extract any player response"), so it is the step
+    that needs the fallback. Raises _DownloadError (plain Hinglish
+    message + full tail + the per-client attempt records) when
+    every client fails — the attempts ride on the exception so the
+    caller can record them even on failure (round 4).
     """
     last_tail = ""
     tried: list[str] = []
+    attempts: list[dict] = []
     for client, extra in _PLAYER_CLIENTS:
         tried.append(client)
+        t0 = time.monotonic()
         try:
             probe = _run_yt_dlp(
                 _base_yt_dlp_args() + extra +
@@ -818,26 +943,39 @@ def _probe_video(url: str) -> tuple[dict, str, list[str]]:
                 timeout=_PROBE_TIMEOUT)
         except subprocess.TimeoutExpired:
             last_tail = f"[{client}] probe timeout ({_PROBE_TIMEOUT}s)"
+            attempts.append({"downloader": "ytdlp", "stage": "probe",
+                             "client": client, "status": "failed",
+                             "error": last_tail,
+                             "duration_s": round(time.monotonic() - t0, 1)})
             continue
+        dur = round(time.monotonic() - t0, 1)
         if probe.returncode == 0:
             try:
-                return json.loads(probe.stdout or "{}"), client, tried
+                info = json.loads(probe.stdout or "{}")
             except Exception:
-                return {}, client, tried
+                info = {}
+            attempts.append({"downloader": "ytdlp", "stage": "probe",
+                             "client": client, "status": "ok", "error": "",
+                             "duration_s": dur})
+            return info, client, tried, attempts
         last_tail = (probe.stderr or probe.stdout or "").strip()[-500:]
-    raise RuntimeError(_download_failed_message(last_tail))
+        attempts.append({"downloader": "ytdlp", "stage": "probe",
+                         "client": client, "status": "failed",
+                         "error": _short_err(last_tail), "duration_s": dur})
+    raise _DownloadError(_download_failed_message(last_tail), last_tail,
+                         attempts=attempts)
 
 
-def _download_via_ytdlp(url: str, job_dir: Path) -> tuple[Path, dict, str, list[str]]:
+def _download_via_ytdlp(url: str, job_dir: Path) -> tuple[Path, dict, str, list[str], list[dict]]:
     """yt-dlp download (probe clients in order, then download).
 
-    Returns (video_path, info_dict, winning_client, clients_tried).
-    Raises _DownloadError (cleaned user message + full stderr tail)
-    on failure.
+    Returns (video_path, info_dict, winning_client, clients_tried,
+    attempts). Raises _DownloadError (cleaned user message + full
+    stderr tail + attempt records) on failure.
     """
     job_dir.mkdir(parents=True, exist_ok=True)
     _check_yt_dlp_installed()
-    info, client, tried = _probe_video(url)
+    info, client, tried, attempts = _probe_video(url)
     out_tmpl = str(job_dir / "video.%(ext)s")
     fmt = ("bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/"
            "best[height<=720][ext=mp4]/best")
@@ -847,6 +985,7 @@ def _download_via_ytdlp(url: str, job_dir: Path) -> tuple[Path, dict, str, list[
     last_tail = ""
     for attempt_no, (cname, extra) in enumerate(order):
         timeout = 1800 if attempt_no == 0 else 900
+        t0 = time.monotonic()
         try:
             dl = _run_yt_dlp(
                 _base_yt_dlp_args() + extra +
@@ -854,17 +993,30 @@ def _download_via_ytdlp(url: str, job_dir: Path) -> tuple[Path, dict, str, list[
                  "-o", out_tmpl, "--no-playlist", url], timeout=timeout)
         except subprocess.TimeoutExpired:
             last_tail = f"[{cname}] download timeout ({timeout}s)"
+            attempts.append({"downloader": "ytdlp", "stage": "download",
+                             "client": cname, "status": "failed",
+                             "error": last_tail,
+                             "duration_s": round(time.monotonic() - t0, 1)})
             dl = None
             continue
+        dur = round(time.monotonic() - t0, 1)
         if dl.returncode == 0:
+            attempts.append({"downloader": "ytdlp", "stage": "download",
+                             "client": cname, "status": "ok", "error": "",
+                             "duration_s": dur})
             break
         last_tail = (dl.stderr or dl.stdout or "").strip()[-500:]
+        attempts.append({"downloader": "ytdlp", "stage": "download",
+                         "client": cname, "status": "failed",
+                         "error": _short_err(last_tail), "duration_s": dur})
         if not _is_blocked(last_tail):
             break  # non-403 error: retrying another client won't help
     else:
-        raise _DownloadError(_download_failed_message(last_tail), last_tail)
+        raise _DownloadError(_download_failed_message(last_tail), last_tail,
+                             attempts=attempts)
     if dl is None or dl.returncode != 0:
-        raise _DownloadError(_download_failed_message(last_tail), last_tail)
+        raise _DownloadError(_download_failed_message(last_tail), last_tail,
+                             attempts=attempts)
     video_path = job_dir / "video.mp4"
     if not video_path.is_file():
         # yt-dlp sometimes keeps another extension when merge fails.
@@ -872,52 +1024,93 @@ def _download_via_ytdlp(url: str, job_dir: Path) -> tuple[Path, dict, str, list[
         if not cands:
             raise _DownloadError(
                 "yt-dlp chala par video file nahi mili — download adhura raha.",
-                last_tail)
+                last_tail, attempts=attempts)
         video_path = cands[0]
-    return video_path, info, client, tried
+    return video_path, info, client, tried, attempts
 
 
-def _download_video(url: str, job_dir: Path) -> tuple[Path, dict, str | None, list[str], str]:
+def _download_video(url: str, job_dir: Path) -> tuple[Path, dict, str | None, list[str], str, list[dict], dict | None]:
     """Download a YouTube video to <job_dir>/video.mp4 (best <=720p).
 
     Route order (round 3): yt-dlp first (all player clients), then
     the Invidious fallback when yt-dlp fails. Returns
     (video_path, info_dict, winning_client_or_None, clients_tried,
-    downloader) where downloader is "yt-dlp" or "invidious".
-    Raises RuntimeError with a plain Hinglish message when every
-    route fails.
+    downloader, attempts, invidious_diag) where downloader is
+    "yt-dlp" or "invidious". Raises _DownloadError (with .attempts
+    and .invidious attached) when every route fails.
+
+    Round 4 guarantee: ANY yt-dlp failure — probe or download, any
+    error type — falls through to Invidious. The only exceptions
+    caught around yt-dlp are _DownloadError and RuntimeError, and
+    BOTH are recorded and fall through; nothing returns or raises
+    early before the fallback. The combined failure message is
+    SHORT by construction (one line naming each route tried) — the
+    round-3 message was ~820 chars and got cut off by the [:600]
+    cap in run_youtube_job, which made the fallback invisible
+    (live job 1705a95b05db).
     """
     job_dir.mkdir(parents=True, exist_ok=True)
     routes = _downloaders_enabled()
     ytdlp_err: _DownloadError | None = None
+    attempts: list[dict] = []
+    inv_diag: dict | None = None
     if "ytdlp" in routes:
         try:
-            video_path, info, client, tried = _download_via_ytdlp(url, job_dir)
-            return video_path, info, client, tried, "yt-dlp"
+            video_path, info, client, tried, dl_attempts = _download_via_ytdlp(url, job_dir)
+            return video_path, info, client, tried, "yt-dlp", dl_attempts, None
         except _DownloadError as exc:
             ytdlp_err = exc
+            attempts = list(exc.attempts or [])
         except RuntimeError as exc:
-            # _probe_video raises plain RuntimeError (already a clean
-            # Hinglish message); keep it the same way.
+            # _check_yt_dlp_installed / unexpected plain RuntimeError:
+            # still a yt-dlp failure — record it and fall through.
             ytdlp_err = _DownloadError(str(exc), str(exc))
     if "invidious" in routes:
         try:
-            video_path, info = _download_via_invidious(
+            video_path, info, inv_diag = _download_via_invidious(
                 _video_id_from_url(url), job_dir)
-            return video_path, info, None, [], "invidious"
+            attempts.append({"downloader": "invidious", "stage": "download",
+                             "client": None, "status": "ok", "error": "",
+                             "duration_s": inv_diag.get("duration_s")})
+            return video_path, info, None, [], "invidious", attempts, inv_diag
+        except _InvidiousError as exc:
+            inv_diag = exc.diag or {"tried": True,
+                                    "instance": _INVIDIOUS_INSTANCES[0],
+                                    "http_status": None,
+                                    "error": str(exc)[:200],
+                                    "streams_found": False,
+                                    "duration_s": None}
+            attempts.append({"downloader": "invidious", "stage": "download",
+                             "client": None, "status": "failed",
+                             "error": _short_err(inv_diag.get("error") or str(exc)),
+                             "duration_s": inv_diag.get("duration_s")})
         except RuntimeError as exc:
-            inv_err = str(exc)
-            base = (str(ytdlp_err) if ytdlp_err else
-                    "yt-dlp route try nahi hua")
-            err = _DownloadError(
-                f"{base} — aur Invidious fallback bhi fail: {inv_err}. "
-                "Thodi der baad phir try karo, ya video file upload karke "
-                "V1 flow use karo.",
-                (ytdlp_err.full_tail if ytdlp_err else "")[:2000])
-            raise err from exc
-    if ytdlp_err is not None:
+            inv_diag = {"tried": True, "instance": _INVIDIOUS_INSTANCES[0],
+                        "http_status": None, "error": str(exc)[:200],
+                        "streams_found": False, "duration_s": None}
+            attempts.append({"downloader": "invidious", "stage": "download",
+                             "client": None, "status": "failed",
+                             "error": _short_err(str(exc)),
+                             "duration_s": None})
+    if inv_diag is None and ytdlp_err is not None:
+        # Only yt-dlp ran (Invidious not enabled): keep the old
+        # detailed message, but attach the attempt records.
+        ytdlp_err.attempts = attempts
         raise ytdlp_err
-    raise RuntimeError("Koi download route enabled nahi hai (VCS_DOWNLOADERS dekho)")
+    if not attempts and ytdlp_err is None and inv_diag is None:
+        raise RuntimeError("Koi download route enabled nahi hai (VCS_DOWNLOADERS dekho)")
+    parts: list[str] = []
+    if ytdlp_err is not None:
+        yt_n = sum(1 for a in attempts if a.get("downloader") == "ytdlp")
+        parts.append(f"yt-dlp: {_short_err(str(ytdlp_err))} ({yt_n} client try kiye)")
+    if inv_diag is not None:
+        host = (inv_diag.get("instance") or "").replace("https://", "")
+        parts.append(f"Invidious ({host}): {_short_err(inv_diag.get('error') or 'fail')}")
+    msg = (" — ".join(parts) + ". Thodi der baad phir try karo, ya video file "
+           "upload karke V1 flow use karo.")
+    raise _DownloadError(
+        msg, (ytdlp_err.full_tail if ytdlp_err else "")[:2000],
+        attempts=attempts, invidious=inv_diag)
 
 
 def _register_download(video_path: Path, title: str) -> dict:
@@ -984,7 +1177,7 @@ def run_youtube_job(job_id: str) -> None:
                     message="YouTube se video download ho raha hai…",
                     result=result)
         job_dir = YT_DIR / job_id
-        video_path, info, client, tried, downloader = _download_video(
+        video_path, info, client, tried, downloader, attempts, inv_diag = _download_video(
             job["url"], job_dir)
         title = str(info.get("title") or "youtube video")
         duration = info.get("duration")
@@ -992,6 +1185,11 @@ def run_youtube_job(job_id: str) -> None:
             result["video_duration_sec"] = round(float(duration), 1)
         result["video_title"] = title
         result["downloader"] = downloader
+        # Round 4: the full attempt record is kept on success too,
+        # so a job's download path is always auditable.
+        result["attempts"] = attempts
+        if inv_diag is not None:
+            result["invidious"] = inv_diag
         if client:
             result["player_client"] = client
             result["clients_tried"] = tried
@@ -1095,9 +1293,17 @@ def run_youtube_job(job_id: str) -> None:
         # Honest failure: keep whatever partial result exists. The
         # FULL yt-dlp stderr tail (warnings included) is kept in
         # the result for diagnostics; the user-facing message
-        # already had the warning lines filtered out.
-        if isinstance(exc, _DownloadError) and exc.full_tail:
-            result["download_stderr_tail"] = exc.full_tail[:2000]
+        # already had the warning lines filtered out. Round 4: the
+        # attempt records and Invidious diagnostics ride on the
+        # exception and are copied here, so a failed job shows
+        # exactly which routes were tried and how each failed.
+        if isinstance(exc, _DownloadError):
+            if exc.full_tail:
+                result["download_stderr_tail"] = exc.full_tail[:2000]
+            if exc.attempts:
+                result["attempts"] = exc.attempts
+            if exc.invidious is not None:
+                result["invidious"] = exc.invidious
         _update_job(job_id, status="failed",
-                    message=f"Job fail ho gaya: {str(exc)[:600]}",
+                    message=f"Job fail ho gaya: {str(exc)[:900]}",
                     result=result)
