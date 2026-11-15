@@ -25,9 +25,17 @@ the real work):
   console script). If the binary is not on PATH we fall back to
   `python -m yt_dlp`.
 - YouTube can block downloads from datacenter IPs (Render) with a
-  bot-check ("Sign in to confirm you're not a bot"). That failure is
-  recorded verbatim in the job (error tail from yt-dlp) — never hidden.
-  Locally (this VM) downloads work.
+  bot-check ("Sign in to confirm you're not a bot"). The download
+  first probes with player clients in order android -> ios -> web
+  (each 120s) and downloads with the first client that works —
+  YouTube often still serves the mobile clients when it 403s the
+  web client. If every client is blocked, the job fails with a plain
+  Hinglish message (try later, or upload the file and use V1).
+  yt-dlp also needs a JS runtime (`node`) or it warns that
+  extraction without one is deprecated: Render's build downloads an
+  official Node 20 tarball into .node/ (render.yaml) and this module
+  puts .node/bin on the subprocess PATH; locally the system node is
+  used. Locally (this VM) downloads work.
 """
 from __future__ import annotations
 
@@ -194,9 +202,55 @@ def _yt_dlp_cmd() -> list[str]:
     return [sys.executable, "-m", "yt_dlp"]
 
 
+# --- Player-client fallback + JS runtime (fix 15 Nov 2026) -----------
+# Live failure on Render: default web client got HTTP 403
+# ("Unable to download API page ... Failed to extract any player
+# response"). YouTube blocks the web client from datacenter IPs but
+# often still serves the mobile clients, so we probe in order
+# android -> ios -> web (120s each) and download with the first
+# client that works. The winning client is recorded in the job
+# result (result["player_client"]) and in the status message.
+_PLAYER_CLIENTS: tuple[tuple[str, list[str]], ...] = (
+    ("android", ["--extractor-args", "youtube:player_client=android",
+                 "--user-agent",
+                 "com.google.android.youtube/19.09.37 "
+                 "(Linux; U; Android 11) gzip"]),
+    ("ios", ["--extractor-args", "youtube:player_client=ios",
+             "--user-agent",
+             "com.google.ios.youtube/19.09.3 "
+             "(iPhone14,3; U; CPU iOS 15_6 like Mac OS X)"]),
+    ("web", []),
+)
+_PROBE_TIMEOUT = 120  # seconds per player-client probe attempt
+
+
+def _yt_dlp_env() -> dict:
+    """Subprocess env for yt-dlp: .node/bin first on PATH if present.
+
+    Render's build extracts the official Node 20 tarball into
+    <project>/.node (render.yaml); locally the system node is used.
+    yt-dlp picks `node` up from PATH as its JS runtime, which
+    silences the "extraction without a JS runtime is deprecated"
+    warning.
+    """
+    env = dict(os.environ)
+    node_dir = ROOT / ".node" / "bin"
+    if node_dir.is_dir() and str(node_dir) not in env.get("PATH", ""):
+        env["PATH"] = f"{node_dir}:{env.get('PATH', '')}"
+    return env
+
+
+def _js_runtime_args() -> list[str]:
+    """Explicit `--js-runtimes node` when a node binary is findable."""
+    env = _yt_dlp_env()
+    if shutil.which("node", path=env.get("PATH", "")):
+        return ["--js-runtimes", "node"]
+    return []
+
+
 def _run_yt_dlp(args: list[str], timeout: int) -> subprocess.CompletedProcess:
     return subprocess.run(_yt_dlp_cmd() + args, capture_output=True,
-                          text=True, timeout=timeout)
+                          text=True, timeout=timeout, env=_yt_dlp_env())
 
 
 def _check_yt_dlp_installed() -> None:
@@ -219,49 +273,94 @@ def _check_yt_dlp_installed() -> None:
             "(requirements.txt me hai)")
 
 
-def _download_video(url: str, job_dir: Path) -> tuple[Path, dict]:
+def _is_blocked(tail: str) -> bool:
+    """True when the yt-dlp error looks like a YouTube bot-check/403."""
+    low = (tail or "").lower()
+    return ("403" in tail or "forbidden" in low
+            or "sign in to confirm" in low or "not a bot" in low
+            or "failed to extract any player response" in low)
+
+
+def _download_failed_message(tail: str) -> str:
+    """Plain Hinglish failure message (+ yt-dlp tail for debugging)."""
+    tail = (tail or "").strip()[-500:]
+    if _is_blocked(tail):
+        return ("YouTube ne is server ko block kar diya hai (bot-check / 403) — "
+                "thodi der baad phir try karo, ya video file upload karke V1 flow "
+                f"use karo. yt-dlp: {tail or 'no error text'}")
+    return ("YouTube video download nahi ho paya — video private, removed, "
+            f"age-restricted ya bot-check ho sakta hai. yt-dlp: {tail or 'no error text'}")
+
+
+def _probe_video(url: str) -> tuple[dict, str, list[str]]:
+    """--dump-json probe, trying player clients in order.
+
+    Returns (info_dict, winning_client, clients_tried). The probe is
+    the step that fails with 403 on a blocked IP ("Failed to extract
+    any player response"), so it is the step that needs the fallback.
+    Raises RuntimeError (plain Hinglish) when every client fails.
+    """
+    last_tail = ""
+    tried: list[str] = []
+    for client, extra in _PLAYER_CLIENTS:
+        tried.append(client)
+        try:
+            probe = _run_yt_dlp(
+                _js_runtime_args() + extra +
+                ["--dump-json", "--no-download", "--no-playlist", url],
+                timeout=_PROBE_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            last_tail = f"[{client}] probe timeout ({_PROBE_TIMEOUT}s)"
+            continue
+        if probe.returncode == 0:
+            try:
+                return json.loads(probe.stdout or "{}"), client, tried
+            except Exception:
+                return {}, client, tried
+        last_tail = (probe.stderr or probe.stdout or "").strip()[-500:]
+    raise RuntimeError(_download_failed_message(last_tail))
+
+
+def _download_video(url: str, job_dir: Path) -> tuple[Path, dict, str]:
     """Download a YouTube video to <job_dir>/video.mp4 (best <=720p).
 
-    First a --dump-json probe (validates the video exists and gives
-    title/duration for the upload row). Then the real download.
-    Returns (video_path, info_dict). Raises RuntimeError with the
-    yt-dlp error tail on any failure — bot-checks, private/removed
-    videos and network errors all land here verbatim.
+    Probes with the player-client fallback first, then downloads
+    with the winning client. If that download itself hits a 403,
+    the remaining clients are retried (900s each); a non-403
+    download error is not retried — another client won't fix it.
+    Returns (video_path, info_dict, winning_client).
+    Raises RuntimeError with a plain Hinglish message on failure.
     """
     job_dir.mkdir(parents=True, exist_ok=True)
     _check_yt_dlp_installed()
-    try:
-        probe = _run_yt_dlp(
-            ["--dump-json", "--no-download", "--no-playlist", url], timeout=180)
-    except subprocess.TimeoutExpired as exc:
-        raise RuntimeError(
-            "YouTube se video info nahi mili (timeout) — network slow hai ya "
-            "YouTube ne rok diya.") from exc
-    if probe.returncode != 0:
-        tail = (probe.stderr or probe.stdout or "").strip()[-600:]
-        raise RuntimeError(
-            "YouTube video download nahi ho paya — video private, removed, "
-            f"age-restricted ya bot-check ho sakta hai. yt-dlp: {tail or 'no error text'}")
-    try:
-        info = json.loads(probe.stdout or "{}")
-    except Exception:
-        info = {}
+    info, client, _tried = _probe_video(url)
     out_tmpl = str(job_dir / "video.%(ext)s")
-    try:
-        dl = _run_yt_dlp([
-            "-f", "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/"
-                  "best[height<=720][ext=mp4]/best",
-            "--merge-output-format", "mp4",
-            "-o", out_tmpl, "--no-playlist", url], timeout=1800)
-    except subprocess.TimeoutExpired as exc:
-        raise RuntimeError(
-            "YouTube download timeout (30 min) — video bahut lambi hai ya "
-            "network bahut slow hai.") from exc
-    if dl.returncode != 0:
-        tail = (dl.stderr or dl.stdout or "").strip()[-600:]
-        raise RuntimeError(
-            "YouTube download fail ho gaya. "
-            f"yt-dlp: {tail or 'no error text'}")
+    fmt = ("bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/"
+           "best[height<=720][ext=mp4]/best")
+    order = ([c for c in _PLAYER_CLIENTS if c[0] == client]
+             + [c for c in _PLAYER_CLIENTS if c[0] != client])
+    dl = None
+    last_tail = ""
+    for attempt_no, (cname, extra) in enumerate(order):
+        timeout = 1800 if attempt_no == 0 else 900
+        try:
+            dl = _run_yt_dlp(
+                _js_runtime_args() + extra +
+                ["-f", fmt, "--merge-output-format", "mp4",
+                 "-o", out_tmpl, "--no-playlist", url], timeout=timeout)
+        except subprocess.TimeoutExpired:
+            last_tail = f"[{cname}] download timeout ({timeout}s)"
+            dl = None
+            continue
+        if dl.returncode == 0:
+            break
+        last_tail = (dl.stderr or dl.stdout or "").strip()[-500:]
+        if not _is_blocked(last_tail):
+            break  # non-403 error: retrying another client won't help
+    else:
+        raise RuntimeError(_download_failed_message(last_tail))
+    if dl is None or dl.returncode != 0:
+        raise RuntimeError(_download_failed_message(last_tail))
     video_path = job_dir / "video.mp4"
     if not video_path.is_file():
         # yt-dlp sometimes keeps another extension when merge fails.
@@ -270,7 +369,7 @@ def _download_video(url: str, job_dir: Path) -> tuple[Path, dict]:
             raise RuntimeError(
                 "yt-dlp chala par video file nahi mili — download adhura raha.")
         video_path = cands[0]
-    return video_path, info
+    return video_path, info, client
 
 
 def _register_download(video_path: Path, title: str) -> dict:
@@ -332,19 +431,21 @@ def run_youtube_job(job_id: str) -> None:
         _update_job(job_id, status="downloading",
                     message="YouTube se video download ho raha hai…")
         job_dir = YT_DIR / job_id
-        video_path, info = _download_video(job["url"], job_dir)
+        video_path, info, client = _download_video(job["url"], job_dir)
         title = str(info.get("title") or "youtube video")
         duration = info.get("duration")
         if duration:
             result["video_duration_sec"] = round(float(duration), 1)
         result["video_title"] = title
+        result["player_client"] = client
 
         # --- register as a normal upload/project ---
         upload = _register_download(video_path, title)
         upload_id = upload["id"]
         result["upload_id"] = upload_id
         _update_job(job_id, upload_id=upload_id, result=result,
-                    message=f"Download ho gaya ({upload['duration_sec']}s) — "
+                    message=f"Download ho gaya (player client: {client}, "
+                            f"{upload['duration_sec']}s) — "
                             "ab transcribe ho raha hai…")
 
         # --- transcribe ---

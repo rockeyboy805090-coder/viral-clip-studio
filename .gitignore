@@ -2,6 +2,7 @@ uploads/
 outputs/
 *.sqlite3
 .venv/
+.venv2/
+.node/
 __pycache__/
 .env
-.venv2/

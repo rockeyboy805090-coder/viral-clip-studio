@@ -13,8 +13,26 @@ services:
     name: viral-clip-studio
     env: python
     plan: free
-    buildCommand: "pip install -r requirements.txt"
-    startCommand: "uvicorn app:app --host 0.0.0.0 --port $PORT"
+    # Node 20 (JS runtime for yt-dlp): Render's Python env has no
+    # `node`, and yt-dlp warns that YouTube extraction without a JS
+    # runtime is deprecated / misses formats. The official linux-x64
+    # tarball needs no root/apt — it is extracted into .node/ inside
+    # the project (build output persists to runtime). Free, ~26 MB
+    # download, ~164 MB on disk. youtube_job.py also puts .node/bin
+    # on the yt-dlp subprocess PATH, so behaviour matches local
+    # (where the system node is used instead).
+    buildCommand: |
+      set -e
+      if [ ! -x .node/bin/node ]; then
+        curl -fsSL https://nodejs.org/dist/v20.18.1/node-v20.18.1-linux-x64.tar.xz -o /tmp/node-v20.tar.xz
+        mkdir -p .node
+        tar -xJf /tmp/node-v20.tar.xz -C .node --strip-components=1
+        rm -f /tmp/node-v20.tar.xz
+      fi
+      export PATH="$PWD/.node/bin:$PATH"
+      node --version
+      pip install -r requirements.txt
+    startCommand: "PATH=\"$PWD/.node/bin:$PATH\" uvicorn app:app --host 0.0.0.0 --port $PORT"
     envVars:
       - key: WHISPER_LANGUAGE
         value: en
